@@ -1,0 +1,53 @@
+{
+  "family": "deep-agent-core-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "<REPLACE: task execution role ARN, e.g. arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole>",
+  "taskRoleArn": "<REPLACE: task role ARN with permission to read the two secrets below>",
+  "containerDefinitions": [
+    {
+      "name": "deep-agent-core-service",
+      "image": "<REPLACE: ECR repository URI and tag, e.g. <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/deep-agent-core-service:latest>",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "AGENT_ENV",
+          "value": "prod"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "valueFrom": "<REPLACE: Secrets Manager ARN for the Anthropic API key>"
+        },
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "<REPLACE: Secrets Manager ARN for the Postgres connection string>"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8080/healthz || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 10
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "<REPLACE: CloudWatch log group, matching this account's existing ECS service naming convention>",
+          "awslogs-region": "<REPLACE: AWS region>",
+          "awslogs-stream-prefix": "deep-agent-core-service"
+        }
+      }
+    }
+  ]
+}

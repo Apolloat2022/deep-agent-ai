@@ -1,0 +1,75 @@
+name: deep-agent-core-service
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Create venv and install dependencies
+        run: |
+          uv venv .venv
+          uv pip install -p .venv \
+            -e deep-agent-core/libs/deepagents \
+            langgraph \
+            langgraph-checkpoint-postgres \
+            "psycopg[binary,pool]" \
+            fastapi \
+            "uvicorn[standard]" \
+            httpx \
+            pytest \
+            pytest-httpx \
+            pytest-asyncio \
+            ruff
+
+      - name: Lint
+        run: .venv/bin/ruff check .
+
+      - name: Test
+        # Integration tests in tests/test_hitl_integration.py skip without
+        # ANTHROPIC_API_KEY. Add it as a repository secret to run them in CI.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: .venv/bin/pytest tests/ -v
+
+  build-and-push:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # REPLACE: this job assumes AWS OIDC federation and an existing ECR
+      # repository, matching this account's other service workflows. No
+      # such workflow exists in this repository to copy from, so the
+      # role-to-assume ARN and ECR repository name below are placeholders --
+      # reconcile them against how the account's other ECS services
+      # authenticate to AWS before relying on this job.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "<REPLACE: OIDC role ARN for GitHub Actions>"
+          aws-region: "<REPLACE: AWS region>"
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: "<REPLACE: ECR repository name, e.g. deep-agent-core-service>"
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"

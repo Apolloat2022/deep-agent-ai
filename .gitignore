@@ -1,0 +1,25 @@
+# Vendored upstream clone -- reproduced by the setup command in PLAN.md,
+# not part of this project's own source. It has its own git history.
+deep-agent-core/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Runtime state and scratch workspace (agent.py / service/persistence.py
+# create these on demand; never durable, never shared).
+state/
+workspace/
+
+# Node (if the React client is later built/bundled in place)
+node_modules/
+
+# Session-local tooling metadata, not project source.
+.claude/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

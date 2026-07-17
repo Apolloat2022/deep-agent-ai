@@ -1,0 +1,15 @@
+tests/
+web/
+docker-compose.dev.yml
+deploy/
+HANDOFF.md
+PLAN.md
+.venv/
+deep-agent-core/.venv/
+state/
+workspace/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.claude/
