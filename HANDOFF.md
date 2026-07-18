@@ -1,12 +1,18 @@
 # Handoff
 
-This document records the work completed across six sessions (Opus,
+This document records the work completed across seven sessions (Opus,
 Sonnet, Sonnet again after a stalled Haiku attempt, Sonnet with real AWS
-access, Sonnet again for the `.env`/dotenv follow-up, then Sonnet once more
-for a temporary model switch and a real bug it exposed) and pins down the
+access, Sonnet again for the `.env`/dotenv follow-up, Sonnet once more for
+a temporary model switch and a real bug it exposed, then Sonnet again for
+an in-progress attempt to create the ECS service) and pins down the
 contracts that were expensive to establish (the approval interrupt payload,
 the persistence topology, the enterprise client behavior, the Bedrock IAM
 pattern) so future work does not rediscover them.
+
+**If picking this up fresh: read Session 7 first.** It's the actual
+current state of the one remaining task (creating the ECS service) and
+documents two live blockers that aren't resolved yet — starting from an
+earlier session's "what's left" list will re-derive ground already covered.
 
 **Current state, as of Session 6:** the account is a real AWS account
 (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
@@ -842,3 +848,97 @@ support case (see the evidence table under Session 4); GitHub OIDC is the
 operator's call; the ECS service itself hasn't been created. Nothing new
 was added to this list — this session fixed a real bug and got the first
 genuine full-stack green run, it did not close any of the AWS-side items.
+
+## Session 7 (in progress, Sonnet): creating the ECS service — two blockers found, unresolved
+
+The operator asked to create the actual ECS service (`aws ecs create-service`).
+Before doing that — a real, running action that starts billing and can fail
+loudly if wrong — two read-only checks turned up genuine blockers. Neither
+is resolved yet. **If this session ends and a new one picks up, start here
+rather than jumping straight to `create-service`.**
+
+### Blocker 1: the ECR repo is still empty
+
+```bash
+aws ecr list-images --repository-name deep-agent-core-service
+# -> {"imageIds": []}
+```
+
+Zero images. Docker Desktop is still unable to start on this machine —
+confirmed again this session (`docker ps` → `Error response from daemon:
+Docker Desktop is unable to start`), the same failure noted in every prior
+session (2, 3, 4, 5). Creating the ECS service now, pointed at
+`...deep-agent-core-service:latest`, would deploy a task that can never
+pull an image and just fails to launch repeatedly — not a useful action to
+take yet.
+
+**Operator is restarting their machine specifically to get Docker
+running.** Once Docker is up, build and push per the commands already in
+this document (Session 4, "GitHub OIDC" section) or the README's Docker
+section:
+
+```bash
+docker build -t 924056189531.dkr.ecr.us-east-1.amazonaws.com/deep-agent-core-service:latest .
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 924056189531.dkr.ecr.us-east-1.amazonaws.com
+docker push 924056189531.dkr.ecr.us-east-1.amazonaws.com/deep-agent-core-service:latest
+```
+
+Recheck with the same `list-images` command above — a non-empty result
+means this blocker is cleared.
+
+### Blocker 2: `riskguard-ai`'s security group does not fit this service
+
+Checked before assuming it could be reused (this session, not before):
+
+```bash
+aws ec2 describe-security-groups --group-ids sg-0400fb362f75e8d25 \
+    --query "SecurityGroups[0].IpPermissions"
+```
+
+Inbound rules on `sg-0400fb362f75e8d25`: TCP 80 from `0.0.0.0/0` (ALB →
+internet), and TCP 8000 self-referencing (ALB → the riskguard-ai task's own
+container port). This service listens on **8080**, not 8000 — reusing this
+security group as-is would create a task nothing could ever reach on its
+actual port. `riskguard-tg` (target group) forwards HTTP on port 8000 to
+`riskguard-alb` (`arn:aws:elasticloadbalancing:us-east-1:924056189531:loadbalancer/app/riskguard-alb/7cff77e34f4e34e0`,
+in `vpc-091813aebe7c9dce3`).
+
+**Not resolved — needs an operator decision**, presented but not yet
+answered (the question was asked, the operator paused to clarify Docker
+first): does this service need public/ALB reachability at all, or is
+VPC-internal access enough? Three real shapes, in order of recommendation:
+
+1. **VPC-internal only, new dedicated security group.** Inbound 8080 from
+   wherever the actual callers are. No load balancer, no public IP,
+   cheapest, most isolated, matches the "dedicated, not shared" pattern
+   already used for IAM roles and Postgres this project. No public URL —
+   needs something else in the same VPC to reach it.
+2. **New dedicated security group + a new target group/listener rule on
+   the existing `riskguard-alb`.** Gets a reachable URL without paying for
+   a second load balancer.
+3. **Fully separate new ALB + target group + security group.** Most
+   isolated from `riskguard-ai`'s infrastructure, real recurring cost
+   (~$20+/month) for a load balancer serving one low traffic internal
+   service.
+
+Whichever is chosen, the security group must allow inbound **8080** (not
+8000) from the actual source of traffic, and must exist in
+`vpc-091813aebe7c9dce3` (or wherever the task's subnets are chosen from) to
+be usable at all.
+
+### Not yet decided, either
+
+* Desired task count for `create-service` (how many replicas).
+* Whether to reuse `riskguard-ai-service`'s subnets
+  (`subnet-0a40c0fa33a76fe16`, `subnet-015aa887174415958`,
+  `subnet-09e70850df6de24d3`, `subnet-0773bd0f7496715c2`,
+  `subnet-084bc3437522e6a57`, `subnet-00b6e9c39dcf9a419`) or a different
+  subnet set.
+
+### Nothing was created this session
+
+No new AWS resources were made while investigating this — both checks were
+read-only (`describe-security-groups`, `describe-target-groups`,
+`list-images`). The task definition from Session 4 (revision 1, `ACTIVE`,
+no placeholders) is still the most current registered version and is still
+correct to use once these two blockers clear.
