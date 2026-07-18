@@ -942,3 +942,180 @@ read-only (`describe-security-groups`, `describe-target-groups`,
 `list-images`). The task definition from Session 4 (revision 1, `ACTIVE`,
 no placeholders) is still the most current registered version and is still
 correct to use once these two blockers clear.
+
+## Session 8 (Sonnet): both Session 7 blockers cleared, service created, a real Dockerfile bug caught and fixed, then blocked again by Docker Desktop itself
+
+The operator restarted their machine specifically to fix Docker Desktop.
+This session picked up right where Session 7 left off, per its own
+instruction to start there rather than re-deriving.
+
+### Blocker 1 (empty ECR repo) — cleared
+
+Docker was confirmed running (`docker ps` succeeded). `docker build` on the
+unmodified `Dockerfile` succeeded for the first time in this project's
+history, then `docker push` to
+`924056189531.dkr.ecr.us-east-1.amazonaws.com/deep-agent-core-service:latest`
+succeeded. `aws ecr list-images` confirmed a non-empty result — this is the
+same image later found to be broken (see the Dockerfile bug below), so
+**this specific pushed digest should not be trusted**; a corrected image was
+prepared but not yet pushed before Docker failed again (see the end of this
+session).
+
+### Blocker 2 (networking decision) — resolved by the operator
+
+Asked directly, in order of recommendation from Session 7. Operator chose:
+**VPC-internal only, new dedicated security group** (option 1); **1** task
+replica; **reuse `riskguard-ai-service`'s subnets**.
+
+Created `sg-0d5a5ad558d893f7c` in `vpc-091813aebe7c9dce3`
+(`deep-agent-core-service-sg`), inbound TCP 8080 from `172.31.0.0/16` (the
+VPC's own CIDR block) only — no ALB, no public inbound path.
+
+### A real deploy-time bug this surfaced: no NAT gateway in this VPC
+
+Before creating the service, `aws ec2 describe-nat-gateways` (empty) and
+`describe-route-tables` (only a route to the internet gateway, no NAT) were
+checked, prompted by realizing "VPC-internal only" as an operator decision
+about *inbound* exposure does not by itself answer whether the task needs
+*outbound* internet access. It does: ECR image pulls, Secrets Manager,
+CloudWatch Logs, Bedrock, and the external Neon Postgres are all reached
+over the public internet from inside this VPC, and this VPC's only route to
+the internet is through the IGW — which requires the task to have a public
+IP, since there's no NAT gateway to translate outbound traffic from a
+private IP. `assignPublicIp: DISABLED` was tried first (misreading "no ALB,
+VPC-internal" as "no public IP"), confirmed broken by watching a task sit
+in `PENDING` and never progress, then corrected to `ENABLED` — this exactly
+matches why `riskguard-ai-service` already runs with `assignPublicIp:
+ENABLED` in these same nominally-"public" subnets despite not being
+internet-facing in the traffic sense: it's the only outbound path available
+in this VPC, not an inbound exposure choice. **The security group still
+gates all inbound traffic** (8080 from the VPC CIDR only), so this does not
+reopen public inbound access; a public IP alone is not the same as an open
+security group.
+
+**If a NAT gateway or VPC endpoints (ECR, Secrets Manager, CloudWatch Logs,
+S3 gateway endpoint) are ever added to this VPC**, `assignPublicIp` could
+then be safely set back to `DISABLED` for tighter isolation. Not done this
+session — out of scope for "create the service," and a NAT gateway is a
+real recurring cost (~$32+/month) that wasn't asked for.
+
+### `aws ecs create-service` — done
+
+```bash
+aws ecs create-service \
+  --cluster riskguard-cluster \
+  --service-name deep-agent-core-service \
+  --task-definition deep-agent-core-service \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[...6 riskguard subnets...],securityGroups=[sg-0d5a5ad558d893f7c],assignPublicIp=ENABLED}"
+```
+
+Service created (`ACTIVE`), `riskguard-cluster/deep-agent-core-service`, one
+task, `FARGATE` launch type / capacity provider, matching
+`riskguard-ai-service`'s pattern (`platformVersion: LATEST`, `ROLLING`
+deployment).
+
+### A second real bug, caught only because this was the first container that ever actually ran: `deepagents` missing at runtime
+
+The task launched, pulled the image successfully (confirming the NAT/public
+IP fix worked), then crash-looped — `STOPPED`, `exitCode: 1`, repeatedly.
+CloudWatch Logs (log group `/ecs/deep-agent-core-service`; on this Windows
+machine, `aws logs` calls needed `MSYS_NO_PATHCONV=1` prefixed or Git Bash's
+path-conversion silently mangles the leading-slash `--log-group-name`
+argument into something that fails AWS's regex validation — worth knowing
+for any future CLI debugging session on this machine) showed:
+
+```
+ModuleNotFoundError: No module named 'deepagents'
+```
+
+Root cause, read directly from `Dockerfile`, not guessed: the builder stage
+installs `deepagents` **editable** (`uv pip install -e
+/app/deep-agent-core/libs/deepagents`) — an editable install does not copy
+the package's files into the venv's `site-packages`, it points back at the
+source directory. The runtime stage only ever copied `/opt/venv`, never the
+`deep-agent-core/libs/deepagents` source tree the editable install depends
+on, so the import target didn't exist in the runtime image. This has been
+wrong since Session 3 wrote the Dockerfile — it could not have been caught
+before now because Docker had never successfully built *and run* a
+container in this project until this session; the build itself doesn't
+fail (the source directory is present in the *builder* stage), only an
+actual `import deepagents` at runtime does.
+
+**Fix applied** (`Dockerfile`): added
+`COPY --from=builder /app/deep-agent-core/libs/deepagents /app/deep-agent-core/libs/deepagents`
+to the runtime stage, same path as the builder stage, right after the
+`/opt/venv` copy. Not yet rebuilt or pushed — Docker Desktop failed again
+(see below) before the rebuild could complete.
+
+**Because the crash loop wastes Fargate task-start time for no benefit**
+(nothing was serving traffic yet — brand new service, zero prior state to
+lose), the service was scaled to **0** (`aws ecs update-service
+--desired-count 0`) rather than left crash-looping while the fix waited on
+Docker. Scale it back to 1 once the corrected image is pushed — nothing
+else about the service needs to change.
+
+### Docker Desktop failed again, mid-rebuild, with a new and more specific error
+
+`docker build` on the corrected `Dockerfile` failed immediately:
+
+```
+ERROR: failed to build: failed to solve: write /var/lib/desktop-containerd/daemon/io.containerd.metadata.v1.bolt/meta.db: read-only file system
+```
+
+`docker ps` immediately after: `Error response from daemon: Docker Desktop
+is unable to start` — the same message from every prior session (2, 3, 4,
+5, 7), except this time the operator's own Docker Desktop UI surfaced a
+more specific dialog while this was happening:
+
+```
+dockerd configuration error
+Error occurred starting dockerd because the configuration is incorrect. To fix the issue, reset the configuration.
+service command failed: daemon.json is invalid: : fork/exec /usr/local/bin/dockerd: input/output error
+```
+
+This is a corrupted `daemon.json` / underlying WSL2 disk issue on this
+specific machine, external to this project. **Deliberately not touched by
+this session**: fixing it means resetting Docker Desktop's configuration or
+data (Settings → Troubleshoot → "Reset to factory defaults" / "Clean /
+Purge data" in the Docker Desktop UI), which can delete images, containers,
+and volumes belonging to *other*, unrelated projects on this machine — not
+a call to make unilaterally. This is now a **third** session (after
+Sessions 2–5, and 7) where this exact class of local Docker failure is the
+blocker, but the first time the specific underlying cause (corrupted
+`daemon.json`) has been visible rather than just "unable to start."
+
+### State at the end of this session
+
+* ECS service `deep-agent-core-service` exists, `ACTIVE`, **desired count
+  0** (deliberately scaled down, not a failure state).
+* Security group `sg-0d5a5ad558d893f7c` created and correctly scoped
+  (8080/VPC-CIDR-only inbound).
+* `Dockerfile` has the `deepagents`-copy fix applied, uncommitted.
+* The image currently in ECR at the `latest` tag is the **broken** one
+  (missing `deepagents`) — do not scale the service back up against it
+  without rebuilding and pushing first.
+* Docker Desktop is down on this machine, needs a manual reset the operator
+  must perform.
+
+### What's left, in order
+
+1. **Operator resets Docker Desktop** (Settings → Troubleshoot → reset/purge).
+2. Rebuild: `docker build -t 924056189531.dkr.ecr.us-east-1.amazonaws.com/deep-agent-core-service:latest .`
+3. Push: same two-command ECR login + `docker push` sequence used earlier in
+   this document (Session 4 / Session 7).
+4. Scale back up: `aws ecs update-service --cluster riskguard-cluster
+   --service deep-agent-core-service --desired-count 1` (or a fresh
+   `--force-new-deployment` if it's already at 1 and still holding the old
+   image).
+5. Watch `aws ecs describe-tasks` / CloudWatch Logs (remember
+   `MSYS_NO_PATHCONV=1` on this machine) for a clean start — specifically,
+   confirm no more `ModuleNotFoundError` and that `/healthz` responds. No
+   ALB exists yet (VPC-internal only), so `/healthz` needs to be hit from
+   inside the VPC — e.g. `aws ecs execute-command` (not currently enabled on
+   this service — `enableExecuteCommand: false`) or a request from another
+   resource in `vpc-091813aebe7c9dce3`.
+6. Bedrock entitlement (Opus 4.8 / Sonnet 5) and GitHub OIDC remain exactly
+   as documented in Sessions 4/6 — unrelated to this session's work, still
+   open.
