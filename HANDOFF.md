@@ -1251,18 +1251,90 @@ The probe task definition was deregistered (`INACTIVE`) immediately after
 around. This closes the "not yet verified" gap noted right above when this
 session was first written.
 
+### A third real bug, found only by checking `runningCount` against `desiredCount`: the container health check was failing 100% of the time
+
+Asked to confirm the service was still scaled to 1 as a routine check, the
+service reported `desiredCount: 1` but **`runningCount: 2`**, with the
+deployment's `failedTasks` counter at 10 and climbing. Both running tasks
+were on the correct, fixed image digest — this was not the `deepagents` or
+`langchain-aws` bug recurring. `aws ecs describe-tasks` showed one task
+`healthStatus: UNHEALTHY`. The container-level health check, defined back
+in Session 3's original scaffold and never exercised end to end until this
+session (no session before this one ever got a container fully running in
+ECS), is:
+
+```
+curl -f http://localhost:8080/healthz || exit 1
+```
+
+The runtime image is `python:3.13-slim`, which does not ship `curl`.
+Confirmed directly (`docker run ... sh -c "which curl"` → `curl: not
+found`, exit 127). The `|| exit 1` in the health check command silently
+swallows that "command not found" and reports it identically to a real
+`/healthz` failure — so the health check has been failing **every single
+time**, on every task, since this service was first created in Session 8.
+The app itself was never unhealthy; nothing could run the check that
+proves it. ECS's service scheduler responds to a container marked
+unhealthy by starting a replacement while (for a time) leaving the old one
+up, which is exactly the `runningCount: 2` / `desiredCount: 1` transient
+state that surfaced this — the service had been silently cycling through
+replacement tasks roughly every ~100 seconds (`startPeriod: 10` +
+`interval: 30` × `retries: 3`) the entire time, invisible unless someone
+compared `runningCount` to `desiredCount` or checked `healthStatus`
+directly instead of just `lastStatus: RUNNING`.
+
+**Fix applied** (`Dockerfile`): added an `apt-get install -y
+--no-install-recommends curl` step (with `rm -rf /var/lib/apt/lists/*` to
+keep the layer small) to the **runtime** stage only — the builder stage
+doesn't need `curl`, and adding it there wouldn't help since the runtime
+stage doesn't inherit the builder's OS package installs, only the
+explicitly `COPY`'d files. Rebuilt, confirmed `curl` present and
+functional (a real connection attempt, not "command not found") before
+pushing. Pushed
+(`sha256:e26f7ef825d958dca1791b9f1fce4eaabc87fc5fc1a80846c5ceebfa7c971bfe`),
+confirmed via `aws ecr describe-images` that `latest` pointed at it, forced
+a new deployment, and this time **`healthStatus` actually reached
+`HEALTHY`** (not just `RUNNING`) — the first time that has ever happened
+for this service. `aws ecs describe-services` afterward showed a single
+`PRIMARY` deployment, `rolloutState: COMPLETED`, `runningCount: 1` ==
+`desiredCount: 1` — genuine steady state, not a transient reading.
+
+**Why local testing didn't catch this originally, and why a full local
+repro wasn't chased down this session either**: a local `docker run` with
+no `DATABASE_URL` set exercises a different code path entirely (the local
+SQLite fallback in `service/persistence.py`), which hits its own separate,
+pre-existing gap — `langgraph-checkpoint-sqlite` was never added to the
+Dockerfile's install list because local SQLite was never meant to run
+inside this container (`AGENT_ENV=prod` with `DATABASE_URL` is always set
+in the real ECS task definition). That gap is real but out of scope here:
+it only matters for someone trying to smoke-test this exact image locally
+without production environment variables, which is not how it's ever
+actually deployed. Confirming the fix required the real ECS environment
+(real `DATABASE_URL`, real AWS credentials via the task role) — the
+`HEALTHY` status from the live task above is the actual evidence, not a
+local repro.
+
 ### State at the end of this session
 
-* ECS service `deep-agent-core-service`: `ACTIVE`, one task, `RUNNING`,
-  stable, running the corrected image
-  (`sha256:70cae01070f6cc02dce9932f6148f2f30efbbac3f639e9e1a57c237508de1f07`).
-* `Dockerfile` has the `[aws]` extra fix applied — **uncommitted** as of
-  this writing; the operator should review and commit it (one line change,
-  `libs/deepagents` → `libs/deepagents[aws]` in the `uv pip install`
-  command).
-* Both bugs that blocked Sessions 7/8 (`deepagents` missing at runtime,
-  `langchain-aws` missing at runtime) are now fixed in the image actually
-  running in ECS.
+* ECS service `deep-agent-core-service`: `ACTIVE`, `desiredCount: 1`,
+  `runningCount: 1`, single `PRIMARY` deployment, `rolloutState:
+  COMPLETED`, task `healthStatus: HEALTHY` — genuine steady state, not a
+  transient reading, confirmed by both the container health check passing
+  and an independent cross-task network probe hitting `/healthz` directly
+  (`200 {"status":"ok"}`).
+* Running image digest:
+  `sha256:e26f7ef825d958dca1791b9f1fce4eaabc87fc5fc1a80846c5ceebfa7c971bfe`.
+* `Dockerfile` has three cumulative fixes now, all committed
+  (`411f5a1` deepagents-copy, and this session's `[aws]` extra + `curl`
+  install): the editable `deepagents` source is present at runtime, the
+  `[aws]` extra supplies `langchain-aws` for `ChatBedrockConverse`, and the
+  runtime stage has `curl` installed so the container health check can
+  actually run instead of silently failing on "command not found."
+* All three bugs that blocked Sessions 7/8/9 (`deepagents` missing at
+  runtime, `langchain-aws` missing at runtime, `curl` missing so the
+  health check always failed) are fixed in the image actually running in
+  ECS, and the fix is confirmed by ECS's own health check reaching
+  `HEALTHY`, not just by `RUNNING` status or an external probe alone.
 
 ### What's left
 
@@ -1271,7 +1343,7 @@ Unchanged from every session since Session 6: Bedrock entitlement for Opus
 Anthropic support case) and GitHub OIDC for automated CI deploys (the
 operator's call, not created). The service currently runs on the temporary
 Sonnet 4.5 default from Session 6. Optionally worth a follow-up, not done
-this session: an actual `/healthz` round trip from inside the VPC, and
-deciding whether the ECR tag-propagation race above is worth engineering
-around (digest-pinning the task definition, or a build-unique tag) if it
+this session: deciding whether the ECR tag-propagation race noted above is
+worth engineering around (digest-pinning the task definition, or a
+build-unique tag) if it
 recurs.

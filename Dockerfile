@@ -29,6 +29,10 @@ RUN uv venv /opt/venv && \
 
 FROM python:3.13-slim AS runtime
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app/deep-agent-core/libs/deepagents /app/deep-agent-core/libs/deepagents
 COPY agent.py /app/agent.py
