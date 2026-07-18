@@ -30,6 +30,7 @@ RUN uv venv /opt/venv && \
 FROM python:3.13-slim AS runtime
 
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app/deep-agent-core/libs/deepagents /app/deep-agent-core/libs/deepagents
 COPY agent.py /app/agent.py
 COPY service/ /app/service/
 
