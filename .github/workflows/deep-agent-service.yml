@@ -26,6 +26,7 @@ jobs:
             fastapi \
             "uvicorn[standard]" \
             httpx \
+            python-dotenv \
             pytest \
             pytest-httpx \
             pytest-asyncio \

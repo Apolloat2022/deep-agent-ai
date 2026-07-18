@@ -1,20 +1,24 @@
 # Handoff
 
-This document records the work completed across four sessions (Opus,
-Sonnet, Sonnet again after a stalled Haiku attempt, then Sonnet with real
-AWS access) and pins down the contracts that were expensive to establish
-(the approval interrupt payload, the persistence topology, the enterprise
-client behavior, the Bedrock IAM pattern) so future work does not
-rediscover them.
+This document records the work completed across five sessions (Opus,
+Sonnet, Sonnet again after a stalled Haiku attempt, Sonnet with real AWS
+access, then Sonnet again for the `.env`/dotenv follow-up) and pins down
+the contracts that were expensive to establish (the approval interrupt
+payload, the persistence topology, the enterprise client behavior, the
+Bedrock IAM pattern) so future work does not rediscover them.
 
-**Current state, as of the Session 4 follow-up:** the account is a real AWS
-account (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered
-and reconciled against rather than guessed. Models are served through
-Amazon Bedrock, not the first party Anthropic API — a deliberate choice
-made once real AWS access existed and revealed the account's existing
-pattern. The operator provisioned a dedicated Neon Postgres instance; the
-`DATABASE_URL` secret is created and `deploy/task-definition.json` is
-registered with ECS (revision 1, `ACTIVE`) with **no placeholders left**.
+**Current state, as of Session 5:** the account is a real AWS account
+(`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
+reconciled against rather than guessed. Models are served through Amazon
+Bedrock, not the first party Anthropic API — a deliberate choice made once
+real AWS access existed and revealed the account's existing pattern. The
+operator provisioned a dedicated Neon Postgres instance; the `DATABASE_URL`
+secret is created, `deploy/task-definition.json` is registered with ECS
+(revision 1, `ACTIVE`) with **no placeholders left**, and — new in Session
+5 — the full `AGENT_ENV=prod` persistence path has been verified against
+that real database (connect, create tables, compile the graph, query
+state), the first genuine end to end Postgres test this project has had.
+`.env` now loads automatically via `python-dotenv` in local development.
 Two things remain genuinely open: Bedrock model access for
 `us.anthropic.claude-opus-4-8` / `us.anthropic.claude-sonnet-5` is
 authorized at the control-plane level but still rejected by the live
@@ -610,3 +614,77 @@ docker run --rm -p 8080:8080 \
     -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
     deep-agent-core-service
 ```
+
+## Session 5 (Sonnet): python-dotenv, and the first real Postgres verification
+
+Two follow-up requests: fix the `.env` file to use a proper `KEY=value`
+format (it held a bare connection string with no name), then wire up
+`python-dotenv` so it loads automatically instead of needing to be sourced
+by hand.
+
+### `.env` corrected, without repeating the earlier mistake
+
+Rewrote `.env` to `DATABASE_URL=<value>` — `DATABASE_URL` chosen because
+it's the name every other part of this project already uses
+(`service/persistence.py`, `docker-compose.dev.yml`, the docs). This time
+the rewrite went through pure file redirection
+(`{ printf 'DATABASE_URL='; cat .env; } > .env.new && mv .env.new .env`) so
+the value was never captured in any command's stdout, and verification
+after the fact checked only the key prefix and byte length, never the
+value itself. Contrast with the redaction mistake in Session 4 — same risk,
+handled correctly this time.
+
+### `python-dotenv` wired into three modules, not one
+
+`load_dotenv()` is a no-op when `.env` doesn't exist (true in production —
+the file is both gitignored and dockerignored) and never overrides a
+variable already present in the real environment, so ECS task definition
+values always take precedence over a stray `.env`. It had to go in three
+places, not just the obvious entry point, because three different modules
+read `os.environ.get(...)` at their own module level and any of them can
+end up being the first thing imported:
+
+* `agent.py` — `ORCHESTRATOR_MODEL`, `SUBAGENT_MODEL`, `AGENT_WORKSPACE`,
+  `AGENT_STATE_DIR` are all read at module level, right after the imports.
+* `service/persistence.py` — `AGENT_STATE_DIR` at module level.
+* `service/clients.py` — not a module-level read (`EnterpriseClientConfig.from_env()`
+  runs lazily, at first tool call), but added anyway so the module is
+  correct in isolation rather than depending on import order.
+
+Each `load_dotenv()` call sits after that module's own imports finish, to
+avoid a ruff E402 (import not at top of file) that an earlier draft of this
+edit hit — imports stay together as a block, `load_dotenv()` runs once
+right before the first `os.environ.get()` call that needs it.
+
+**Verified**: importing `agent` with `DATABASE_URL` deliberately absent
+from the shell environment beforehand results in `DATABASE_URL` present in
+`os.environ` afterward — length checked (149 characters), value never
+printed.
+
+### First real, successful `AGENT_ENV=prod` verification this project
+
+Docker Desktop has been down on this machine for the entire project
+(Sessions 2, 3, and 4 all note it). The operator's Neon Postgres instance —
+reachable over the network, no Docker required — made a genuine end to end
+test possible for the first time: `open_persistence()` connected to the
+real database, `AsyncPostgresSaver` and `AsyncPostgresStore` both ran their
+`setup()` (creating the actual LangGraph checkpoint and store tables),
+`build_agent()` compiled the full graph against that live persistence, and
+`agent.aget_state(...)` executed a real query against it successfully. This
+is meaningfully stronger evidence than the import-level checks in earlier
+sessions — an actual round trip against the actual database this service
+will use in production.
+
+**One real, Windows-only obstacle surfaced and resolved during this test**:
+`psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run
+in async mode`. Windows' default asyncio event loop is incompatible with
+psycopg's async driver; Linux (ECS's runtime) does not have this problem —
+its default loop is already selector-based. Fixed for the verification run
+by passing `loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector())`
+to `asyncio.run(...)`, per psycopg's own error message. **Deliberately not
+patched into the application itself** — forcing a global event loop policy
+change to work around a narrow "test prod persistence locally on Windows"
+scenario risks side effects on other async code in the process, in
+particular `deepagents`' subprocess-based `execute` tool, which may have
+reasons to want the platform default loop on Windows. Documented as a
+workaround in README.md's Docker section instead of engineered around.

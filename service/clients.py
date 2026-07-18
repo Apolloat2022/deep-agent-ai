@@ -23,6 +23,12 @@ import os
 from dataclasses import dataclass
 
 import httpx
+from dotenv import load_dotenv
+
+# Idempotent and a no-op when .env is absent (always true in production).
+# Called here too so this module reads correct config even if imported
+# before agent.py in some other entry point (e.g. a standalone script).
+load_dotenv()
 
 _ERROR_BODY_PREVIEW_CHARS = 500
 

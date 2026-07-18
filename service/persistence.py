@@ -20,9 +20,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator
 
+from dotenv import load_dotenv
+
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.store.base import BaseStore
+
+# Safe to call again if agent.py already loaded it in this process --
+# load_dotenv() is idempotent and a no-op when the file is absent (always
+# true in production). Keeps this module correct if ever imported first.
+load_dotenv()
 
 STATE_DIR = Path(os.environ.get("AGENT_STATE_DIR", "./state")).resolve()
 

@@ -24,7 +24,8 @@ RUN uv venv /opt/venv && \
         "psycopg[binary,pool]" \
         fastapi \
         "uvicorn[standard]" \
-        httpx
+        httpx \
+        python-dotenv
 
 FROM python:3.13-slim AS runtime
 

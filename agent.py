@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
+from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -48,6 +49,14 @@ from service.clients import EnterpriseClientError, get_enterprise_client
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.store.base import BaseStore
+
+# Loaded before any os.environ.get() below: fills in local dev values from
+# a project root .env file (typically just DATABASE_URL and the
+# ENTERPRISE_API_* vars -- this project uses Bedrock, so there is no
+# Anthropic API key to load). A no-op if the file does not exist, which is
+# the case in production, and never overrides a variable already set in the
+# real environment (ECS task definition values always win).
+load_dotenv()
 
 ORCHESTRATOR_MODEL = os.environ.get(
     "ORCHESTRATOR_MODEL", "bedrock_converse:us.anthropic.claude-opus-4-8"

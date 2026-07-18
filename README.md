@@ -44,6 +44,7 @@ uv pip install -p .venv \
     fastapi \
     "uvicorn[standard]" \
     httpx \
+    python-dotenv \
     pytest \
     pytest-httpx \
     pytest-asyncio \
@@ -64,7 +65,18 @@ On Windows PowerShell, replace `deep-agent-core/.venv/bin/python` with
 
 ## Configuration
 
-All configuration is read from environment variables.
+All configuration is read from environment variables. `agent.py`,
+`service/persistence.py`, and `service/clients.py` each call
+`load_dotenv()` on import, so a project root `.env` file is picked up
+automatically for local development -- no need to `export` every variable
+by hand. `.env` is gitignored and dockerignored; it never ships in the
+image, and any variable already set in the real environment (an ECS task
+definition value, for example) always wins over the file. Create one at the
+project root if you want it:
+
+```
+DATABASE_URL=postgresql://user:password@host:5432/dbname
+```
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -174,6 +186,24 @@ docker compose -f docker-compose.dev.yml up -d
 export AGENT_ENV=prod
 export DATABASE_URL=postgresql://deepagent:deepagent@localhost:5432/deepagent
 ```
+
+A managed instance (Neon, RDS, etc.) works the same way -- just set
+`DATABASE_URL` to its connection string instead, in `.env` or exported
+directly.
+
+**Windows only:** testing `AGENT_ENV=prod` by running Python directly on
+Windows (not inside the Linux container) fails with
+`psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop'` --
+psycopg's async driver needs a selector event loop, which is not the
+asyncio default on Windows. Run with:
+
+```bash
+python -c "import asyncio, selectors; asyncio.run(main(), loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()))"
+```
+
+or set `WindowsSelectorEventLoopPolicy` before starting uvicorn. Not an
+issue in the container or on ECS -- `ProactorEventLoop` is Windows-only;
+Linux's default loop is already selector-based.
 
 ## Project layout
 
