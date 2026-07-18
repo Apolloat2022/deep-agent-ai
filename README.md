@@ -93,6 +93,21 @@ DATABASE_URL=postgresql://user:password@host:5432/dbname
 
 ## Usage
 
+### See it work end to end (recommended first run)
+
+[`examples/run_demo.py`](examples/run_demo.py) drives the real service against
+a bundled mock backend and walks the full tool-call and human-approval loop --
+fetch an entity, reason over it via Bedrock, pause on the gated
+`submit_change_request` tool, approve, submit. One command; it starts and stops
+the mock for you:
+
+```bash
+deep-agent-core/.venv/bin/python examples/run_demo.py
+```
+
+See [examples/README.md](examples/README.md) for the expected output and how to
+point the same flow at a real backend.
+
 ### Run the standalone smoke test
 
 Exercises the full graph once, end to end, using local SQLite persistence:
@@ -214,6 +229,7 @@ service/
   persistence.py                Async SQLite or Postgres checkpointer and store, by AGENT_ENV
   clients.py                    Async client for the enterprise data and workflow API
 tests/                          Unit tests (no API key needed) and HITL integration tests
+examples/                       Runnable end-to-end demo: real service against a mock backend
 web/deep-agent-client/          React hook and example component for the SSE contract
 deploy/task-definition.json     ECS task definition, with placeholders for account specific values
 Dockerfile                      Multi stage build for the service container
