@@ -1,13 +1,23 @@
 # Handoff
 
-This document records the work completed across three sessions (Opus,
-Sonnet, then Sonnet again after a stalled Haiku attempt) and pins down the
-contracts that were expensive to establish (the approval interrupt payload,
-the persistence topology, the enterprise client behavior) so future work
-does not rediscover them. As of Session 3, every item originally planned in
-this document is either done and verified, or done with explicit
-`<REPLACE: ...>` placeholders where a real value can only come from the
-operator's AWS account. Nothing is left unassigned.
+This document records the work completed across four sessions (Opus,
+Sonnet, Sonnet again after a stalled Haiku attempt, then Sonnet with real
+AWS access) and pins down the contracts that were expensive to establish
+(the approval interrupt payload, the persistence topology, the enterprise
+client behavior, the Bedrock IAM pattern) so future work does not
+rediscover them.
+
+**Current state, as of Session 4:** the account is a real AWS account
+(`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
+reconciled against rather than guessed. Models are served through Amazon
+Bedrock, not the first party Anthropic API — a deliberate choice made once
+real AWS access existed and revealed the account's existing pattern (see
+Session 4 and the model strategy section in `PLAN.md`). Two things remain
+genuinely open, both because they are the operator's call, not because
+anything was skipped: provisioning Postgres and creating the `DATABASE_URL`
+secret, and deciding whether to set up GitHub OIDC federation for automated
+CI deploys (this account has none at all right now). Both are spelled out
+exactly, with commands, in Session 4 below.
 
 ## Session 1 (Opus): service scaffold
 
@@ -148,6 +158,15 @@ must resume first.
 * The filesystem backend workspace (`AGENT_WORKSPACE`) is scratch space, not
   durable state. Anything that must survive belongs in the store or the
   checkpointer, both of which are Postgres in prod.
+* **Dedicated, not shared (Session 4).** This account already runs a Postgres
+  behind `riskguard-ai/database-url` (no RDS/Aurora instance in the account —
+  it's hosted somewhere this project's discovery couldn't inspect). The
+  operator explicitly chose a **separate, dedicated** Postgres for this
+  service over sharing that one, to keep LangGraph's checkpoint and store
+  tables isolated from Riskguard's application schema. The execution role's
+  IAM policy is scoped to a secret named `deep-agent-core-service/database-url`
+  specifically — it cannot read `riskguard-ai/database-url` even if pointed
+  at it by mistake. See Session 4 for the exact secret creation command.
 
 ## Contract 3: enterprise client configuration
 
@@ -169,6 +188,38 @@ must resume first.
   `EnterpriseClientError` from the client; the tool functions in `agent.py`
   catch it and return the message as the tool result string, so the model
   sees a plain English failure and the graph run does not crash.
+
+## Contract 4: Bedrock model access and IAM (Session 4)
+
+* **Two different things gate model access, both required.** IAM permission
+  (`bedrock:InvokeModel` on the right resource ARNs) is necessary but not
+  sufficient — Bedrock also requires accepting a per-model usage agreement
+  at the account level, entirely separate from IAM. A role with correct IAM
+  permissions still gets `AccessDeniedException` if the account hasn't
+  accepted that model's agreement. Distinguish the two by the error: an IAM
+  problem cites the principal and action; the entitlement error says
+  `"... is not available for this account"`.
+* **Cross region inference profile IDs, not bare model IDs.** Every current
+  generation model checked in this account (`anthropic.claude-opus-4-8`,
+  `anthropic.claude-sonnet-5`) only supports `INFERENCE_PROFILE` invocation,
+  confirmed via `aws bedrock get-foundation-model`. Use the `us.`-prefixed
+  profile ID (`us.anthropic.claude-opus-4-8`) everywhere — in code, in IAM
+  policies, and in any manual `aws bedrock-runtime converse` test.
+* **IAM policy needs both ARNs per model.** A working `bedrock:InvokeModel`
+  policy for a cross region inference profile lists two resources: the
+  wildcard-region foundation model ARN
+  (`arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-4-8`) **and**
+  the region-specific inference profile ARN
+  (`arn:aws:bedrock:us-east-1:924056189531:inference-profile/us.anthropic.claude-opus-4-8`).
+  Confirmed by reading `riskguard-task-role`'s actual working policy before
+  writing `deep-agent-core-task-role`'s, not by guessing at Bedrock's IAM
+  model.
+* **`init_chat_model("bedrock_converse:<profile-id>")`** is the entry point
+  used in `agent.py`. The bare `bedrock:` prefix (or an unprefixed
+  `anthropic.*` model string) resolves to the older `ChatBedrock` client
+  instead of `ChatBedrockConverse` — functionally different client, confirmed
+  by reading `langchain`'s provider dispatch table directly rather than
+  assumed from memory.
 
 ## Work done by Sonnet — see Session 2 above
 
@@ -192,6 +243,11 @@ originally written for Haiku — no scope was added.
 
 ### 1. Dockerfile — done (`Dockerfile`, `.dockerignore`)
 
+> **Superseded in part by Session 4**: the `docker run` example below still
+> shows `ANTHROPIC_API_KEY`. The service no longer uses it — see Session 4
+> for the real AWS-credential-based run command. The Dockerfile itself
+> (build stages, install command) is unaffected by the model change.
+
 Two stage build exactly as specified: `builder` installs into `/opt/venv`
 via `uv`, `runtime` copies the venv and app code, `EXPOSE 8080`,
 `CMD uvicorn service.app:app --host 0.0.0.0 --port 8080`. `.dockerignore`
@@ -206,10 +262,16 @@ never actually run. The install command inside the Dockerfile is the same
 successfully against this exact dependency set multiple times this session
 outside Docker — high confidence, but not a substitute for a real build.
 Run `docker build -t deep-agent-core-service .` once Docker is healthy, then
-`docker run --rm -e ANTHROPIC_API_KEY=<real key> -p 8080:8080
-deep-agent-core-service` and `curl http://localhost:8080/healthz`.
+see Session 4 for the current, correct `docker run` command and
+`curl http://localhost:8080/healthz`.
 
-### 2. ECS task definition — done, with placeholders (`deploy/task-definition.json`)
+### 2. ECS task definition — superseded by Session 4
+
+The account was hypothetical when this was first written; every placeholder
+described below has since been filled in with real values, or replaced with
+a more specific placeholder, once real AWS access existed. **Read Session 4,
+not this section, for the current state of `deploy/task-definition.json`.**
+Left here only as a record of the original scaffold:
 
 Valid JSON (parsed and confirmed). One container, `deep-agent-core-service`,
 `containerPort: 8080`, `AGENT_ENV=prod`, `ANTHROPIC_API_KEY` and
@@ -219,12 +281,13 @@ hitting `/healthz`, and an `awslogs` log configuration block.
 **What is a real guess, not copied from anything**: `cpu: 512` /
 `memory: 1024` — there was no existing service's task definition available
 in this workspace to copy sizing from, so this is a reasonable small-Fargate
-default for a low traffic internal service, not a measured value. Every
-field with a `<REPLACE: ...>` placeholder (execution role ARN, task role
-ARN, ECR image URI, both Secrets Manager ARNs, log group name, region) needs
-a real value from the operator's AWS account — these were deliberately left
-as placeholders rather than invented, per the original instruction not to
-guess ARN naming conventions.
+default for a low traffic internal service, not a measured value. (Session 4
+confirmed this guess against the real `riskguard-ai` task definition — it
+matches exactly.) Every field with a `<REPLACE: ...>` placeholder (execution
+role ARN, task role ARN, ECR image URI, both Secrets Manager ARNs, log group
+name, region) needs a real value from the operator's AWS account — these
+were deliberately left as placeholders rather than invented, per the
+original instruction not to guess ARN naming conventions.
 
 ### 3. Health check endpoint — done and verified (`service/app.py`)
 
@@ -243,7 +306,15 @@ async def healthz() -> dict[str, str]:
 Full test suite re-run afterward: still 13 passed, 3 skipped, same count as
 before the change.
 
-### 4. CI — done, with placeholders (`.github/workflows/deep-agent-service.yml`)
+### 4. CI — superseded in part by Session 4
+
+The `test` job's dependency install and `ANTHROPIC_API_KEY` secret injection
+below are stale — Session 4 removed the API key entirely and switched the
+integration test gate to AWS credential resolution. The `build-and-push`
+job's AWS auth placeholder is still current: **this account confirmed to
+have no GitHub OIDC provider at all** (Session 4 checked, did not guess).
+Read Session 4 for the current file content and what "no OIDC provider"
+actually means for next steps.
 
 Valid YAML (parsed and confirmed; jobs `test` and `build-and-push` both
 present). `test` job: checkout, install `uv`, install the same dependency
@@ -262,7 +333,8 @@ process), which is not a template for this operator's ECS deployment
 pattern. The AWS auth step (`role-to-assume`, ECR repository name) is
 placeholder-flagged for the same reason as the task definition — reconcile
 against however the account's other services authenticate to AWS from
-GitHub Actions (most likely OIDC, assumed here, but not confirmed).
+GitHub Actions (most likely OIDC, assumed here, but not confirmed at the
+time this was written — confirmed absent in Session 4).
 
 ### 5. Docstring and formatting pass — done and verified
 
@@ -276,3 +348,216 @@ existed either way). Then `ruff format --check --diff` to preview, then
 `tests/test_hitl_integration.py`), both pure line-wrap changes, no logic
 touched. Full test suite re-run after: still 13 passed, 3 skipped, same
 count as before.
+
+## Session 4 (Sonnet, with real AWS credentials): Bedrock migration and live provisioning
+
+The operator asked to fill in the ECS placeholders with real values.
+`aws sts get-caller-identity` confirmed a real, credentialed account:
+`924056189531`, `us-east-1`, IAM user `Riskguard-ai`. Everything from here
+on is discovery or action against that real account, not a hypothetical one.
+
+**Every AWS mutation in this section was a deliberate, individually
+justified action** — read-only discovery first, then only the actions that
+are cheap and reversible (ECR repo, log group, IAM roles scoped to least
+privilege) proceeded directly; the two consequential decisions (Bedrock vs.
+API key, shared vs. dedicated Postgres) and the one contractual action
+(accepting Bedrock's usage agreement) were put to the operator explicitly
+before acting. Nothing was created that wasn't asked for or clearly implied
+by an explicit operator decision.
+
+### Discovery, before any decision or mutation
+
+Read-only AWS calls found: one existing ECR repository (`riskguard-ai`), one
+ECS cluster (`riskguard-cluster`) running one service
+(`riskguard-ai-service`), and its full task definition. That existing
+service authenticates to Claude via **Amazon Bedrock** using its ECS task
+role's IAM permissions (`invoke-bedrock` inline policy scoped to a specific
+model + inference profile ARN pair) — not a static API key. Its execution
+role has a `read-db-secret` inline policy scoped to one Secrets Manager
+secret (`riskguard-ai/database-url`). No RDS or Aurora instance exists
+anywhere in the account or region, meaning that secret points at Postgres
+hosted somewhere this discovery couldn't see (external provider, or another
+region) — its actual value was never read.
+
+This surfaced two decisions that were not mine to make silently, so they
+were put to the operator directly:
+
+1. **Claude access: first party Anthropic API (as built) vs. Amazon Bedrock
+   (matching the account's existing pattern).** Operator chose **Bedrock**.
+2. **Postgres: share `riskguard-ai`'s existing database vs. a separate,
+   dedicated instance.** Operator chose **dedicated** — isolates this
+   service's LangGraph checkpoints from Riskguard's application data, no
+   shared blast radius, no schema collision risk.
+
+### Bedrock migration (`agent.py`)
+
+`langchain-aws` installed via the `deepagents[aws]` extra (already declared
+in `libs/deepagents/pyproject.toml` — no new dependency invented).
+`ORCHESTRATOR_MODEL` / `SUBAGENT_MODEL` defaults changed from
+`anthropic:claude-opus-4-8` / `anthropic:claude-sonnet-5` to
+`bedrock_converse:us.anthropic.claude-opus-4-8` /
+`bedrock_converse:us.anthropic.claude-sonnet-5`. Three things confirmed by
+direct testing, not inferred from documentation:
+
+* `init_chat_model`'s provider dispatch table (read directly from the
+  installed `langchain` source, not assumed) maps `bedrock_converse:` to
+  `langchain_aws.ChatBedrockConverse` — the Converse API client, not the
+  older `ChatBedrock` that plain `bedrock:` or a bare `anthropic.*` model ID
+  would resolve to.
+* Both target models exist in this account **only** as `us-east-1` cross
+  region inference profiles (confirmed via
+  `aws bedrock get-foundation-model --query modelDetails.inferenceTypesSupported`
+  → `INFERENCE_PROFILE` for both, no `ON_DEMAND`). The bare foundation model
+  ID (`anthropic.claude-opus-4-8`) will 400; the profile ID
+  (`us.anthropic.claude-opus-4-8`) is required. This matches the pattern the
+  existing `riskguard-ai` service already uses.
+* `region_name` defaults to `None` on `ChatBedrockConverse`, which falls
+  through to boto3's standard credential/region chain — so `AWS_REGION` as a
+  plain environment variable is sufficient; nothing needs to be hardcoded in
+  code.
+
+`tests/test_hitl_integration.py`'s skip gate changed from
+`os.environ.get("ANTHROPIC_API_KEY")` to a real check
+(`boto3.Session().get_credentials() is not None` plus `AWS_REGION` /
+`AWS_DEFAULT_REGION` set) — the old gate was checking for a credential the
+service no longer uses.
+
+**Verified**: the graph compiles with zero `ANTHROPIC_API_KEY` anywhere in
+the environment. The exact code path (`init_chat_model("bedrock_converse:...")`
+→ real `.invoke()`) was run against `us.anthropic.claude-sonnet-4-5-20250929-v1:0`
+(the model `riskguard-ai` already has access to) and returned a real
+response — proving the LangChain integration is correct, independent of
+entitlement. The same code path against the two target models
+(`us.anthropic.claude-opus-4-8`, `us.anthropic.claude-sonnet-5`) currently
+fails with `AccessDeniedException` — see the entitlement note below; this is
+an account-level propagation delay, not a code or IAM problem.
+
+### Bedrock model access agreement
+
+Neither target model was invokable at first — confirmed via a real
+`aws bedrock-runtime converse` call to each, both returning
+`AccessDeniedException: ... is not available for this account`, distinct
+from an IAM permissions error. Model access on Bedrock is a separate,
+per-model entitlement layered on top of IAM. A use case questionnaire was
+already on file for this account (`aws bedrock get-use-case-for-model-access`
+returned existing `formData`, presumably submitted when `riskguard-ai` was
+set up), so the only remaining step was accepting each model's usage
+agreement. Both offers were checked before acting: standard published
+pricing ($5/$25 per million tokens for Opus 4.8; $2/$10 introductory for
+Sonnet 5), not a special or negotiated rate. **This was put to the operator
+explicitly before acting** — accepting a usage agreement is a real
+contractual action on the account, not a technical toggle, even at list
+price. Operator approved; both agreements were accepted via
+`aws bedrock create-foundation-model-agreement` (one call per model, both
+returned success).
+
+**Not yet verified as unblocked**: as of the last check in this session
+(roughly 20 minutes after acceptance), both models still return
+`AccessDeniedException`. AWS documents that access can take a few minutes
+to propagate after acceptance; this can occasionally take longer. This was
+not chased further with a polling loop. **Recheck before relying on this**:
+
+```bash
+aws bedrock-runtime converse --model-id "us.anthropic.claude-opus-4-8" \
+    --messages '[{"role":"user","content":[{"text":"ok"}]}]' \
+    --inference-config '{"maxTokens":10}'
+```
+
+If it still 403s after a longer wait, the acceptance may need to be redone
+or checked in the Bedrock console under Model access.
+
+### AWS resources created (real, in the account, all read back and confirmed)
+
+All of the following were created directly — cheap, reversible, and clear
+extensions of what was explicitly asked for (filling in ECS placeholders
+requires these to exist):
+
+| Resource | Value |
+| --- | --- |
+| ECR repository | `924056189531.dkr.ecr.us-east-1.amazonaws.com/deep-agent-core-service` |
+| CloudWatch log group | `/ecs/deep-agent-core-service` (30 day retention) |
+| IAM task role | `arn:aws:iam::924056189531:role/deep-agent-core-task-role` — trust: `ecs-tasks.amazonaws.com`. Inline policy `invoke-bedrock`: `bedrock:InvokeModel` + `bedrock:InvokeModelWithResponseStream` on exactly four resource ARNs (the wildcard-region foundation-model ARN and the region-specific inference-profile ARN, for each of the two target models) — mirrors `riskguard-task-role`'s scoping pattern exactly, confirmed by reading that role's actual policy first, not guessed. |
+| IAM execution role | `arn:aws:iam::924056189531:role/deep-agent-core-execution-role` — `AmazonECSTaskExecutionRolePolicy` managed policy attached (ECR pull, log write), plus inline policy `read-db-secret` scoped to `secretsmanager:GetSecretValue` on `arn:aws:secretsmanager:us-east-1:924056189531:secret:deep-agent-core-service/database-url-*`. The trailing `-*` matches Secrets Manager's random suffix on the name I'm asking the operator to use — see below. |
+
+`deploy/task-definition.json` and `.github/workflows/deep-agent-service.yml`
+were updated with these real ARNs, the real ECR URI, `AGENT_ENV=prod`, and
+`AWS_REGION=us-east-1`. `ANTHROPIC_API_KEY` was removed from both files —
+Bedrock needs no API key.
+
+**Not registered with ECS** (`aws ecs register-task-definition`): the file
+still has one placeholder (`DATABASE_URL`'s `valueFrom`), which would just
+fail schema validation on that field — a throwaway registration for that
+sole purpose seemed lower value than leaving a stray revision in the
+account, so it was skipped. Register it for real once the secret below
+exists.
+
+### What is still genuinely open — this is what's left for the operator
+
+**1. Provision Postgres and create the `DATABASE_URL` secret.** Per the
+operator's own "dedicated Postgres" decision — this repo doesn't create
+databases. Once you have a connection string, create the secret with this
+exact name (the execution role's IAM policy is scoped to this name prefix,
+so a different name will not work without also updating that policy):
+
+```bash
+aws secretsmanager create-secret \
+    --name deep-agent-core-service/database-url \
+    --secret-string "postgresql://<user>:<password>@<host>:5432/<dbname>"
+```
+
+Then put the resulting `ARN` from that command's output into
+`deploy/task-definition.json`'s `DATABASE_URL.valueFrom`, and register the
+task definition:
+
+```bash
+aws ecs register-task-definition --cli-input-json file://deploy/task-definition.json
+```
+
+**2. GitHub OIDC for automated CI deploys — optional, and a bigger decision
+than anything else in this document.** `aws iam list-open-id-connect-providers`
+returned empty: this account has **no** federated trust from GitHub Actions
+at all, for any repo. Setting this up means creating an OIDC identity
+provider (a new trust boundary into the account from an external identity
+issuer) plus an IAM role whose trust policy is scoped to this specific
+GitHub repo (`Apolloat2022/deep-agent-ai`) and branch. This is a bigger,
+more foundational security decision than the roles created above — those
+grant permissions to an AWS-internal principal (`ecs-tasks.amazonaws.com`)
+already trusted by design; an OIDC provider extends trust to an external
+identity. It was not created without being asked. Until it exists, build
+and push the image manually:
+
+```bash
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 924056189531.dkr.ecr.us-east-1.amazonaws.com
+docker build -t 924056189531.dkr.ecr.us-east-1.amazonaws.com/deep-agent-core-service:latest .
+docker push 924056189531.dkr.ecr.us-east-1.amazonaws.com/deep-agent-core-service:latest
+```
+
+**3. Create the ECS service.** `deploy/task-definition.json` defines the
+task; nothing in this repo creates the running service, load balancer
+target group, or `aws ecs create-service` call. `riskguard-ai-service`'s
+existing network configuration (subnets, security group `sg-0400fb362f75e8d25`,
+`assignPublicIp: ENABLED`) is a reasonable template if this service should
+sit in the same network — but that's your call, not filled in here, since a
+task definition doesn't need networking info and this document didn't want
+to guess whether reusing that security group's rules is appropriate for a
+different service.
+
+### Local Docker note, still unresolved
+
+Docker Desktop remains unable to start on this machine (same error as
+Sessions 2 and 3). The Bedrock work in this session did not depend on it —
+all verification was done via direct Python/boto3 calls and the AWS CLI, not
+a container build.
+
+### Docker run, updated for Bedrock
+
+Supersedes the `docker run -e ANTHROPIC_API_KEY=...` example under Session
+3, item 1. Outside ECS there is no task role, so pass AWS credentials in
+explicitly:
+
+```bash
+docker run --rm -p 8080:8080 \
+    -e AWS_REGION=us-east-1 \
+    -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+    deep-agent-core-service
+```

@@ -11,6 +11,16 @@ demonstrates the three integration points required by the platform:
    result instead of failing, so this module runs standalone.
 3. Durable persistence through a local SQLite checkpointer and store.
 
+Models are served through Amazon Bedrock (``langchain_aws.ChatBedrockConverse``,
+selected via the ``bedrock_converse:`` prefix on ``init_chat_model``), matching
+the authentication pattern already used by this AWS account's other ECS
+services: the ECS task role's IAM permissions grant access, not a static API
+key. Both model IDs below are Bedrock cross region inference profile IDs, not
+the bare Anthropic model IDs, since neither Opus 4.8 nor Sonnet 5 supports
+on demand invocation in this account and region. Bedrock model access is a
+separate, per model entitlement from IAM permissions; see HANDOFF.md for how
+that was granted for this account.
+
 The compiled graph is exposed through the ``build_agent`` factory so a
 FastAPI service constructs it once at startup and reuses it across
 requests. Conversation state is isolated per thread via the LangGraph
@@ -39,8 +49,12 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.store.base import BaseStore
 
-ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "anthropic:claude-opus-4-8")
-SUBAGENT_MODEL = os.environ.get("SUBAGENT_MODEL", "anthropic:claude-sonnet-5")
+ORCHESTRATOR_MODEL = os.environ.get(
+    "ORCHESTRATOR_MODEL", "bedrock_converse:us.anthropic.claude-opus-4-8"
+)
+SUBAGENT_MODEL = os.environ.get(
+    "SUBAGENT_MODEL", "bedrock_converse:us.anthropic.claude-sonnet-5"
+)
 WORKSPACE_DIR = Path(os.environ.get("AGENT_WORKSPACE", "./workspace")).resolve()
 STATE_DIR = Path(os.environ.get("AGENT_STATE_DIR", "./state")).resolve()
 
@@ -175,7 +189,9 @@ def build_agent(
 
 
 async def _run_smoke_test() -> None:
-    """Invoke the agent once end to end. Requires ``ANTHROPIC_API_KEY``.
+    """Invoke the agent once end to end. Requires AWS credentials with
+    Bedrock access (a configured profile, or the default credential chain)
+    and the ``AWS_REGION`` environment variable set.
 
     Async because ``fetch_entity_record`` and ``submit_change_request``
     are coroutine-only tools (they call ``EnterpriseClient`` over async

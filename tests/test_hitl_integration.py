@@ -5,11 +5,15 @@ HANDOFF.md): send a message that triggers the gated ``submit_change_request``
 tool, assert the streamed ``interrupt`` event has the documented shape, then
 resume with a decision and assert the resulting tool message.
 
-Requires ``ANTHROPIC_API_KEY``; skipped otherwise. This mirrors the deepagents
-library's own HITL test (`test_hitl.py`): the prompt explicitly instructs the
-model to call a specific tool with specific arguments so the interrupt is
-deterministic, and the assertions check SDK structural state, not model
-judgment.
+Requires resolvable AWS credentials with Bedrock access and an
+``AWS_REGION``; skipped otherwise. Models are served through Amazon Bedrock
+(see agent.py), so there is no API key to gate on -- the precondition is
+whatever boto3's default credential chain resolves (an IAM role in CI or
+ECS, a local profile, or explicit env vars), plus a region. This mirrors
+the deepagents library's own HITL test (`test_hitl.py`): the prompt
+explicitly instructs the model to call a specific tool with specific
+arguments so the interrupt is deterministic, and the assertions check SDK
+structural state, not model judgment.
 
 Startup/shutdown are invoked directly rather than through the ASGI lifespan
 protocol, since ``service.app`` registers its persistence and agent setup
@@ -23,12 +27,23 @@ import json
 import os
 import uuid
 
+import boto3
 import httpx
 import pytest
 
+
+def _aws_credentials_available() -> bool:
+    if not (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")):
+        return False
+    try:
+        return boto3.Session().get_credentials() is not None
+    except Exception:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("ANTHROPIC_API_KEY"),
-    reason="requires a real ANTHROPIC_API_KEY to drive the model",
+    not _aws_credentials_available(),
+    reason="requires resolvable AWS credentials and AWS_REGION to drive the model via Bedrock",
 )
 
 

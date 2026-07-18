@@ -4,6 +4,8 @@ A supervisor style deep agent built on the [deepagents](https://github.com/langc
 harness (LangGraph runtime), wrapped in a FastAPI service with streaming and
 human in the loop approval. Intended to integrate with an existing React,
 TypeScript, and Python enterprise stack and deploy as a container on ECS.
+Models are served through Amazon Bedrock: authentication is IAM based, via
+the ECS task role, not a static API key.
 
 For the architecture and design decisions behind this project, see
 [PLAN.md](PLAN.md). For exact API contracts, what has been verified in which
@@ -14,7 +16,11 @@ environment, and what is still placeholder work for the operator, see
 
 * Python 3.11 or newer
 * [uv](https://docs.astral.sh/uv/)
-* An `ANTHROPIC_API_KEY`
+* AWS credentials with Bedrock access to `us.anthropic.claude-opus-4-8` and
+  `us.anthropic.claude-sonnet-5` in `us-east-1` (a local AWS profile for
+  development, the ECS task role in production), plus `AWS_REGION` set.
+  Bedrock model access is a separate, per model entitlement from IAM
+  permissions -- see [HANDOFF.md](HANDOFF.md) for how it was granted.
 * Docker, only if building the container image or running the local Postgres
   compose file
 
@@ -22,14 +28,15 @@ environment, and what is still placeholder work for the operator, see
 
 Clone the upstream deepagents library and build a virtual environment. This
 step is not vendored into this repository; `deep-agent-core/` is
-gitignored and reproduced fresh by the commands below.
+gitignored and reproduced fresh by the commands below. Install the `aws`
+extra so `langchain-aws` is available for the Bedrock client.
 
 ```bash
 git clone https://github.com/langchain-ai/deepagents deep-agent-core
 cd deep-agent-core
 uv venv .venv
 uv pip install -p .venv \
-    -e ./libs/deepagents \
+    -e "./libs/deepagents[aws]" \
     langgraph \
     langgraph-checkpoint-sqlite \
     langgraph-checkpoint-postgres \
@@ -47,7 +54,7 @@ cd ..
 Validate the install by compiling a real agent graph:
 
 ```bash
-deep-agent-core/.venv/bin/python -c "from deepagents import create_deep_agent; a = create_deep_agent(model='anthropic:claude-opus-4-8', tools=[], system_prompt='validation'); print(type(a).__name__)"
+deep-agent-core/.venv/bin/python -c "from deepagents import create_deep_agent; a = create_deep_agent(model='bedrock_converse:us.anthropic.claude-opus-4-8', tools=[], system_prompt='validation'); print(type(a).__name__)"
 ```
 
 Expected output: `CompiledStateGraph`.
@@ -57,14 +64,13 @@ On Windows PowerShell, replace `deep-agent-core/.venv/bin/python` with
 
 ## Configuration
 
-All configuration is read from environment variables. Set an `ANTHROPIC_API_KEY`
-before running anything that calls a model.
+All configuration is read from environment variables.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | none, required | Anthropic API key |
-| `ORCHESTRATOR_MODEL` | `anthropic:claude-opus-4-8` | Model for the top level agent |
-| `SUBAGENT_MODEL` | `anthropic:claude-sonnet-5` | Model for the research subagent |
+| `AWS_REGION` | none, required | Region for Bedrock and, if used, other AWS calls. Both target models are only available as `us-east-1` cross region inference profiles in this account. |
+| `ORCHESTRATOR_MODEL` | `bedrock_converse:us.anthropic.claude-opus-4-8` | Model for the top level agent. The `bedrock_converse:` prefix selects `langchain_aws.ChatBedrockConverse` via `init_chat_model`; the `us.` prefix on the model ID is a cross region inference profile, not the bare foundation model ID -- neither target model supports on demand invocation in this account. |
+| `SUBAGENT_MODEL` | `bedrock_converse:us.anthropic.claude-sonnet-5` | Model for the research subagent |
 | `AGENT_WORKSPACE` | `./workspace` | Filesystem root the agent's file tools operate in |
 | `AGENT_STATE_DIR` | `./state` | Local SQLite checkpoint and store files, used when persistence is not injected |
 | `AGENT_ENV` | `local` | `local` selects async SQLite, `prod` selects async Postgres |
@@ -80,14 +86,14 @@ before running anything that calls a model.
 Exercises the full graph once, end to end, using local SQLite persistence:
 
 ```bash
-export ANTHROPIC_API_KEY=your-key-here
+export AWS_REGION=us-east-1
 deep-agent-core/.venv/bin/python agent.py
 ```
 
 ### Run the FastAPI service
 
 ```bash
-export ANTHROPIC_API_KEY=your-key-here
+export AWS_REGION=us-east-1
 deep-agent-core/.venv/bin/python -m uvicorn service.app:app --reload
 ```
 
@@ -139,18 +145,26 @@ pending action before the run continues. Each decision is one of `approve`,
 deep-agent-core/.venv/bin/python -m pytest tests/ -v
 ```
 
-`tests/test_clients.py` and `tests/test_service_sse.py` need no API key and
+`tests/test_clients.py` and `tests/test_service_sse.py` need no credentials and
 no network access; they mock HTTP with `pytest-httpx`. `tests/test_hitl_integration.py`
 drives a real model through the full approve, reject, and busy thread flows
-and is skipped automatically unless `ANTHROPIC_API_KEY` is set.
+and is skipped automatically unless AWS credentials and `AWS_REGION` resolve
+(checked via `boto3.Session().get_credentials()`).
 
 ## Docker
 
-Build and run the container:
+Build and run the container. Outside ECS there is no task role, so pass AWS
+credentials in explicitly -- either mount `~/.aws` or export the standard
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` variables:
 
 ```bash
 docker build -t deep-agent-core-service .
-docker run --rm -p 8080:8080 -e ANTHROPIC_API_KEY=your-key-here deep-agent-core-service
+docker run --rm -p 8080:8080 \
+    -e AWS_REGION=us-east-1 \
+    -e AWS_ACCESS_KEY_ID \
+    -e AWS_SECRET_ACCESS_KEY \
+    -e AWS_SESSION_TOKEN \
+    deep-agent-core-service
 ```
 
 For a local Postgres instance to test the `AGENT_ENV=prod` persistence path:
@@ -181,10 +195,23 @@ HANDOFF.md                      API contracts and per session verification statu
 
 ## Deploying to ECS
 
-`deploy/task-definition.json` and `.github/workflows/deep-agent-service.yml`
-are scaffolded and valid but contain `<REPLACE: ...>` placeholders for values
-that only exist in your AWS account: the ECR repository URI, IAM role ARNs,
-Secrets Manager ARNs for `ANTHROPIC_API_KEY` and `DATABASE_URL`, the log
-group name, and the OIDC role used by CI to push images. Fill these in
-before deploying. See the CI section of [HANDOFF.md](HANDOFF.md) for what
-was and was not verified in this environment.
+`deploy/task-definition.json` is filled in with real values from this AWS
+account (account `924056189531`, region `us-east-1`): the ECR repository,
+the dedicated `deep-agent-core-task-role` and `deep-agent-core-execution-role`
+IAM roles, and the CloudWatch log group all exist and are referenced by their
+real ARNs. Two things remain before this can actually deploy:
+
+1. **`DATABASE_URL` secret.** Not created -- provisioning Postgres is a real
+   infrastructure and cost decision left to you. Create the secret with the
+   exact name `deep-agent-core-service/database-url` (the execution role's
+   IAM policy is scoped to that name prefix) once you have a connection
+   string. Exact command in [HANDOFF.md](HANDOFF.md).
+2. **CI deploy automation.** This AWS account has no GitHub Actions OIDC
+   provider at all yet (confirmed, not assumed). The `build-and-push` job in
+   `.github/workflows/deep-agent-service.yml` has a placeholder
+   `role-to-assume` until that federation exists. Until then, build and push
+   the image manually, or set up OIDC first -- see [HANDOFF.md](HANDOFF.md)
+   for what that involves.
+
+See [HANDOFF.md](HANDOFF.md) for the full account discovery, the Bedrock
+model access grant, and exactly what was and was not verified live.

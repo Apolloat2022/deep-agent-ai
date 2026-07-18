@@ -19,7 +19,7 @@ jobs:
         run: |
           uv venv .venv
           uv pip install -p .venv \
-            -e deep-agent-core/libs/deepagents \
+            -e "deep-agent-core/libs/deepagents[aws]" \
             langgraph \
             langgraph-checkpoint-postgres \
             "psycopg[binary,pool]" \
@@ -34,11 +34,19 @@ jobs:
       - name: Lint
         run: .venv/bin/ruff check .
 
+      # Models are served through Amazon Bedrock (see agent.py), so there is
+      # no ANTHROPIC_API_KEY. tests/test_hitl_integration.py skips cleanly
+      # without resolvable AWS credentials -- this step is a no-op until the
+      # OIDC role below exists, at which point it starts exercising the real
+      # approve/reject/409 flows against Bedrock in CI.
+      - name: Configure AWS credentials
+        if: ${{ vars.AWS_OIDC_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+
       - name: Test
-        # Integration tests in tests/test_hitl_integration.py skip without
-        # ANTHROPIC_API_KEY. Add it as a repository secret to run them in CI.
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: .venv/bin/pytest tests/ -v
 
   build-and-push:
@@ -48,17 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # REPLACE: this job assumes AWS OIDC federation and an existing ECR
-      # repository, matching this account's other service workflows. No
-      # such workflow exists in this repository to copy from, so the
-      # role-to-assume ARN and ECR repository name below are placeholders --
-      # reconcile them against how the account's other ECS services
-      # authenticate to AWS before relying on this job.
+      # This account has no GitHub Actions OIDC provider yet (confirmed via
+      # `aws iam list-open-id-connect-providers` -- empty). role-to-assume is
+      # a placeholder until that federation is set up; see HANDOFF.md for
+      # what that setup involves and why it wasn't created automatically.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: "<REPLACE: OIDC role ARN for GitHub Actions>"
-          aws-region: "<REPLACE: AWS region>"
+          role-to-assume: "<REPLACE: OIDC role ARN for GitHub Actions, once the OIDC provider exists>"
+          aws-region: us-east-1
 
       - name: Login to Amazon ECR
         id: ecr-login
@@ -67,7 +73,7 @@ jobs:
       - name: Build and push image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          ECR_REPOSITORY: "<REPLACE: ECR repository name, e.g. deep-agent-core-service>"
+          ECR_REPOSITORY: deep-agent-core-service
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
