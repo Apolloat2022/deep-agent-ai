@@ -9,6 +9,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # id-token: write is required for the OIDC step below to mint a token and
+    # assume AWS_OIDC_ROLE_ARN. Without it, configure-aws-credentials fails.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -54,17 +59,21 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # id-token: write lets this job assume the OIDC role to push to ECR.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
-      # This account has no GitHub Actions OIDC provider yet (confirmed via
-      # `aws iam list-open-id-connect-providers` -- empty). role-to-assume is
-      # a placeholder until that federation is set up; see HANDOFF.md for
-      # what that setup involves and why it wasn't created automatically.
+      # OIDC federation set up in Session 10: provider
+      # token.actions.githubusercontent.com plus the role below, whose trust
+      # policy is scoped to repo:Apolloat2022/deep-agent-ai:*. The role grants
+      # ECR push (this job) and Bedrock invoke (the test job). See HANDOFF.md.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: "<REPLACE: OIDC role ARN for GitHub Actions, once the OIDC provider exists>"
+          role-to-assume: "arn:aws:iam::924056189531:role/deep-agent-core-github-actions"
           aws-region: us-east-1
 
       - name: Login to Amazon ECR

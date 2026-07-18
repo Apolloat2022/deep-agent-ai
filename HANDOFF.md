@@ -9,11 +9,12 @@ contracts that were expensive to establish (the approval interrupt payload,
 the persistence topology, the enterprise client behavior, the Bedrock IAM
 pattern) so future work does not rediscover them.
 
-**If picking this up fresh: read Session 9 first.** The ECS service is now
-up and running cleanly against a real Bedrock model — Session 9 closed out
-the deploy that Sessions 7 and 8 were blocked on. Only the two long-standing
-AWS-side items (Bedrock entitlement for Opus 4.8/Sonnet 5, GitHub OIDC)
-remain open.
+**If picking this up fresh: read Session 9 first**, then Session 10. The ECS
+service is up and running cleanly against a real Bedrock model (Session 9
+closed out the deploy that Sessions 7 and 8 were blocked on), and GitHub
+OIDC federation for CI is now fully wired (Session 10). Only one
+long-standing AWS-side item remains open: Bedrock entitlement for Opus
+4.8/Sonnet 5.
 
 **Current state, as of Session 6:** the account is a real AWS account
 (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
@@ -1347,3 +1348,88 @@ this session: deciding whether the ECR tag-propagation race noted above is
 worth engineering around (digest-pinning the task definition, or a
 build-unique tag) if it
 recurs.
+
+## Session 10 (Opus): GitHub OIDC federation wired up end to end
+
+The operator created the GitHub Actions OIDC identity provider in the AWS
+console (the one foundational piece flagged as "the operator's call" in
+every prior session) and asked what remained. Creating the provider is only
+the trust anchor — it grants nothing by itself — so this session built out
+the three pieces that make it usable, all confirmed against the real
+account.
+
+### Provider verified, not assumed
+
+`aws iam get-open-id-connect-provider` confirmed the operator's provider is
+configured correctly: URL `token.actions.githubusercontent.com`, audience
+(`ClientIDList`) `sts.amazonaws.com` — which is exactly what
+`aws-actions/configure-aws-credentials@v4` requests, so no audience mismatch.
+
+### IAM role created (`deep-agent-core-github-actions`)
+
+`arn:aws:iam::924056189531:role/deep-agent-core-github-actions`. Trust
+policy: `sts:AssumeRoleWithWebIdentity` from the OIDC provider, gated on
+`aud == sts.amazonaws.com` and `sub` matching
+`repo:Apolloat2022/deep-agent-ai:*` (any branch/tag/PR in this one repo).
+The operator chose the repo-wildcard scope over branch-only deliberately —
+the `test` job runs on `pull_request` as well as `main` pushes, so a
+main-only `sub` would have blocked PR builds from assuming the role. Only
+same-repo workflows ever receive an OIDC token (forks don't), so the
+wildcard is still locked to this repository.
+
+Inline policy `ci-ecr-push-and-bedrock`, scoped to exactly what the two CI
+jobs do and nothing more (no ECS permissions — the workflow does not deploy):
+
+* **ECR push** (`build-and-push` job): `ecr:GetAuthorizationToken` on `*`
+  (required — this action has no resource scope) plus the standard
+  layer-upload/`PutImage` set scoped to the
+  `deep-agent-core-service` repository ARN only.
+* **Bedrock invoke** (`test` job's integration tests): `bedrock:InvokeModel`
+  + `...WithResponseStream` on the same Opus 4.8 / Sonnet 5 foundation-model
+  + inference-profile ARN pairs the task role uses, **plus** the Sonnet 4.5
+  pair (`anthropic.claude-sonnet-4-5-20250929-v1:0` /
+  `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). Sonnet 4.5 was added
+  because `agent.py`'s current default is the temporary Sonnet 4.5 (Session
+  6) and it's the one model with working entitlement — without it the CI
+  integration tests would `AccessDenied` on the only model they can actually
+  reach.
+
+### Workflow changes (`.github/workflows/deep-agent-service.yml`)
+
+* `build-and-push`'s `role-to-assume` placeholder replaced with the real
+  role ARN.
+* **`permissions: { id-token: write, contents: read }` added to BOTH jobs.**
+  This was missing and is not optional: without `id-token: write` the job's
+  `GITHUB_TOKEN` cannot mint the OIDC token, and `configure-aws-credentials`
+  fails. The default token permissions do not include it. Easy to overlook
+  because the placeholder role ARN would have failed first anyway; now that
+  the ARN is real, this is what would have bitten next.
+* YAML re-validated after the edits (`yaml.safe_load`, clean).
+
+### Operator-side step, done
+
+The operator set the GitHub repo **variable** `AWS_OIDC_ROLE_ARN` to the
+role ARN (Settings → Secrets and variables → Actions → Variables).
+`gh` is not installed on this machine, so this was the one step done in the
+GitHub UI rather than from here. Note the `test` job reads this variable and
+its AWS step is gated on `vars.AWS_OIDC_ROLE_ARN != ''`; the
+`build-and-push` job has the ARN hardcoded and does not depend on the
+variable.
+
+### What this does and does not automate
+
+The workflow **builds and pushes to ECR only** — it does not roll the image
+out to ECS. After a green `build-and-push`, a deploy still needs
+`aws ecs update-service --cluster riskguard-cluster --service
+deep-agent-core-service --force-new-deployment` (the Session 9 pattern). The
+operator chose to keep it this way for now rather than add an ECS deploy
+step; if that changes, the role needs `ecs:UpdateService` (and likely
+`iam:PassRole` for the task/execution roles) added to
+`ci-ecr-push-and-bedrock`, and a deploy step after the push.
+
+### What's left
+
+Only Bedrock entitlement for Opus 4.8 / Sonnet 5 remains from the
+long-standing list (Session 4's evidence table — an AWS/Anthropic support
+case, not a code change). OIDC is no longer on that list. The service still
+runs on the temporary Sonnet 4.5 default (Session 6).
