@@ -20,6 +20,11 @@ node_modules/
 # Session-local tooling metadata, not project source.
 .claude/
 
+# Local secrets -- never committed. Holds the Neon Postgres connection
+# string among other local-only config.
+.env
+.env.*
+
 # OS/editor noise
 .DS_Store
 Thumbs.db
