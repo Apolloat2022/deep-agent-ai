@@ -14,6 +14,10 @@ __pycache__/
 state/
 workspace/
 
+# Scratch state written by the examples/run_demo.py demo.
+examples/.demo_state/
+examples/.demo_workspace/
+
 # Node (if the React client is later built/bundled in place)
 node_modules/
 
