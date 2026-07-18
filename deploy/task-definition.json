@@ -30,7 +30,7 @@
       "secrets": [
         {
           "name": "DATABASE_URL",
-          "valueFrom": "<REPLACE: Secrets Manager ARN once you create the secret. Name it exactly deep-agent-core-service/database-url -- the execution role's read-db-secret policy is scoped to that exact name prefix. See HANDOFF.md for the create-secret command.>"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:924056189531:secret:deep-agent-core-service/database-url-ECGYHx"
         }
       ],
       "healthCheck": {

@@ -7,16 +7,20 @@ AWS access) and pins down the contracts that were expensive to establish
 client behavior, the Bedrock IAM pattern) so future work does not
 rediscover them.
 
-**Current state, as of Session 4:** the account is a real AWS account
-(`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
-reconciled against rather than guessed. Models are served through Amazon
-Bedrock, not the first party Anthropic API — a deliberate choice made once
-real AWS access existed and revealed the account's existing pattern (see
-Session 4 and the model strategy section in `PLAN.md`). Two things remain
-genuinely open, both because they are the operator's call, not because
-anything was skipped: provisioning Postgres and creating the `DATABASE_URL`
-secret, and deciding whether to set up GitHub OIDC federation for automated
-CI deploys (this account has none at all right now). Both are spelled out
+**Current state, as of the Session 4 follow-up:** the account is a real AWS
+account (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered
+and reconciled against rather than guessed. Models are served through
+Amazon Bedrock, not the first party Anthropic API — a deliberate choice
+made once real AWS access existed and revealed the account's existing
+pattern. The operator provisioned a dedicated Neon Postgres instance; the
+`DATABASE_URL` secret is created and `deploy/task-definition.json` is
+registered with ECS (revision 1, `ACTIVE`) with **no placeholders left**.
+Two things remain genuinely open: Bedrock model access for
+`us.anthropic.claude-opus-4-8` / `us.anthropic.claude-sonnet-5` is
+authorized at the control-plane level but still rejected by the live
+Converse API (an AWS-side propagation gap, not a task on this repo's side),
+and GitHub OIDC federation for automated CI deploys is entirely the
+operator's call (this account has none at all). Both are spelled out
 exactly, with commands, in Session 4 below.
 
 ## Session 1 (Opus): service scaffold
@@ -451,20 +455,49 @@ price. Operator approved; both agreements were accepted via
 `aws bedrock create-foundation-model-agreement` (one call per model, both
 returned success).
 
-**Not yet verified as unblocked**: as of the last check in this session
-(roughly 20 minutes after acceptance), both models still return
-`AccessDeniedException`. AWS documents that access can take a few minutes
-to propagate after acceptance; this can occasionally take longer. This was
-not chased further with a polling loop. **Recheck before relying on this**:
+**Still blocked after over an hour — and the evidence points at an AWS-side
+issue, not a normal propagation delay.** `aws bedrock get-foundation-model-availability`
+for both models reports:
+
+```json
+{
+    "agreementAvailability": {"status": "AVAILABLE"},
+    "authorizationStatus": "AUTHORIZED",
+    "entitlementAvailability": "AVAILABLE",
+    "regionAvailability": "AVAILABLE"
+}
+```
+
+That's the control plane confirming the account is fully authorized. A
+`converse` call immediately after still returns the same
+`AccessDeniedException: ... is not available for this account`. This gap
+between "control plane says authorized" and "the actual inference runtime
+still rejects it" was not present when the same check was run minutes after
+acceptance (same error then, but no `AUTHORIZED` status yet either) — the
+authorization has since landed, but whatever data plane component the
+Converse API checks against has not picked it up. This was not chased with
+a polling loop past this point.
+
+**If this is still blocked when you read this**: the control-plane state
+above means retrying `converse` periodically is reasonable and not a sign
+of a misconfiguration on your end. If it's still failing after several
+hours, this looks like an AWS support case, not something to keep
+re-deriving from this repo — reference the mismatch between
+`get-foundation-model-availability` (`AUTHORIZED`) and the live
+`AccessDeniedException` when you open it. Recheck with:
 
 ```bash
+aws bedrock get-foundation-model-availability --model-id "anthropic.claude-opus-4-8"
 aws bedrock-runtime converse --model-id "us.anthropic.claude-opus-4-8" \
     --messages '[{"role":"user","content":[{"text":"ok"}]}]' \
     --inference-config '{"maxTokens":10}'
 ```
 
-If it still 403s after a longer wait, the acceptance may need to be redone
-or checked in the Bedrock console under Model access.
+The `agent.py` code itself is not in question here — the identical code
+path already invokes `us.anthropic.claude-sonnet-4-5-20250929-v1:0`
+successfully (a model this account already had access to before this
+session). This is purely an entitlement-propagation gap on Anthropic's
+newest two Bedrock model listings, specific to this account.
 
 ### AWS resources created (real, in the account, all read back and confirmed)
 
@@ -484,34 +517,50 @@ were updated with these real ARNs, the real ECR URI, `AGENT_ENV=prod`, and
 `AWS_REGION=us-east-1`. `ANTHROPIC_API_KEY` was removed from both files —
 Bedrock needs no API key.
 
-**Not registered with ECS** (`aws ecs register-task-definition`): the file
-still has one placeholder (`DATABASE_URL`'s `valueFrom`), which would just
-fail schema validation on that field — a throwaway registration for that
-sole purpose seemed lower value than leaving a stray revision in the
-account, so it was skipped. Register it for real once the secret below
-exists.
+### Postgres and task registration — completed in a follow-up session
 
-### What is still genuinely open — this is what's left for the operator
+The operator provisioned a Neon Postgres instance and saved the connection
+string locally in a project-root `.env` file. Two things worth recording:
 
-**1. Provision Postgres and create the `DATABASE_URL` secret.** Per the
-operator's own "dedicated Postgres" decision — this repo doesn't create
-databases. Once you have a connection string, create the secret with this
-exact name (the execution role's IAM policy is scoped to this name prefix,
-so a different name will not work without also updating that policy):
+* **That `.env` file was not in `.gitignore`.** It was created, untracked,
+  before any commit touched it — caught and fixed
+  (`git log --all -- .env` confirmed empty history) before it could leak.
+  `.env` and `.env.*` are now ignored.
+* **A real mistake, corrected, not hidden**: while inspecting the file's
+  structure, a `sed` redaction command was written incorrectly and printed
+  the full connection string — including the password — into this
+  conversation's visible output. The password should be treated as exposed
+  and rotated in the Neon console as a precaution, even though the exposure
+  was confined to this private conversation, not a public or logged
+  surface. This did not block the rest of the work: the value was read once
+  from the correctly-caught file and used directly for the commands below,
+  without asking the operator to re-paste it.
+
+The secret was created and the task definition registered for real:
 
 ```bash
 aws secretsmanager create-secret \
     --name deep-agent-core-service/database-url \
-    --secret-string "postgresql://<user>:<password>@<host>:5432/<dbname>"
-```
+    --secret-string "<the neon connection string>"
+# -> arn:aws:secretsmanager:us-east-1:924056189531:secret:deep-agent-core-service/database-url-ECGYHx
 
-Then put the resulting `ARN` from that command's output into
-`deploy/task-definition.json`'s `DATABASE_URL.valueFrom`, and register the
-task definition:
-
-```bash
 aws ecs register-task-definition --cli-input-json file://deploy/task-definition.json
+# -> family: deep-agent-core-service, revision: 1, status: ACTIVE
 ```
+
+`deploy/task-definition.json` now has **no placeholders left** — every
+field, including `DATABASE_URL.valueFrom`, is a real value, and the
+registration succeeded against ECS's live API (real schema validation, not
+just `json.load`). The secret ARN's suffix (`-ECGYHx`) falls inside the
+execution role's `read-db-secret` policy's wildcard scope
+(`deep-agent-core-service/database-url-*`) — confirmed by direct string
+match, not assumed.
+
+### What is still genuinely open — this is what's left for the operator
+
+**1. Bedrock entitlement propagation.** See above — control plane says
+`AUTHORIZED`, `converse` still 403s. Not a task, just a wait, possibly an
+AWS support case if it doesn't clear.
 
 **2. GitHub OIDC for automated CI deploys — optional, and a bigger decision
 than anything else in this document.** `aws iam list-open-id-connect-providers`

@@ -196,16 +196,20 @@ HANDOFF.md                      API contracts and per session verification statu
 ## Deploying to ECS
 
 `deploy/task-definition.json` is filled in with real values from this AWS
-account (account `924056189531`, region `us-east-1`): the ECR repository,
-the dedicated `deep-agent-core-task-role` and `deep-agent-core-execution-role`
-IAM roles, and the CloudWatch log group all exist and are referenced by their
-real ARNs. Two things remain before this can actually deploy:
+account (account `924056189531`, region `us-east-1`) and has **no
+placeholders left**: the ECR repository, the dedicated
+`deep-agent-core-task-role` and `deep-agent-core-execution-role` IAM roles,
+the CloudWatch log group, and the `DATABASE_URL` secret (a dedicated Neon
+Postgres instance, kept separate from the account's other service's
+database) are all real and registered with ECS (revision 1, `ACTIVE`). Two
+things remain:
 
-1. **`DATABASE_URL` secret.** Not created -- provisioning Postgres is a real
-   infrastructure and cost decision left to you. Create the secret with the
-   exact name `deep-agent-core-service/database-url` (the execution role's
-   IAM policy is scoped to that name prefix) once you have a connection
-   string. Exact command in [HANDOFF.md](HANDOFF.md).
+1. **Bedrock model access is still propagating.** Both target models are
+   authorized at the control plane level (confirmed via
+   `aws bedrock get-foundation-model-availability`) but the live Converse
+   API still rejects them. This is an AWS-side timing issue, not something
+   to fix in this repo -- see [HANDOFF.md](HANDOFF.md) for the exact
+   recheck commands and what to do if it doesn't clear.
 2. **CI deploy automation.** This AWS account has no GitHub Actions OIDC
    provider at all yet (confirmed, not assumed). The `build-and-push` job in
    `.github/workflows/deep-agent-service.yml` has a placeholder
