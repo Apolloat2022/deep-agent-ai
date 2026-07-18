@@ -1224,18 +1224,32 @@ reading during the swap (a `runningCount: 2` seen mid-transition was the two
 deployments overlapping for a few seconds, not a real problem, and resolved
 on its own).
 
-### What was not verified
+### `/healthz` verified with a real network round trip, in a follow-up check
 
-`/healthz` itself was not curled — there is still no ALB (VPC-internal
-only, per Session 8's networking decision) and `enableExecuteCommand` is
-still `false` on this service, so nothing in this session had a path to
-reach port 8080 directly. The evidence for a healthy service is the clean
-CloudWatch startup log (FastAPI's own `/healthz` route registration
-happens as part of that same successful startup) plus the stable
-`RUNNING` status, not a direct HTTP round trip. If a real end-to-end
-`/healthz` check matters, that needs either `enableExecuteCommand: true`
-plus `aws ecs execute-command`, or a request from another resource already
-inside `vpc-091813aebe7c9dce3`.
+Done without touching the running service's IAM or `enableExecuteCommand`
+setting (both real, more invasive changes): registered a throwaway task
+definition (`healthz-probe-oneoff`, `curlimages/curl` image, logs to the
+same `/ecs/deep-agent-core-service` log group) and ran it once via
+`aws ecs run-task` in the same subnet as the target task, with the VPC's
+default security group for egress and `assignPublicIp: ENABLED` (needed to
+pull the public image, same reasoning as the main service's networking).
+The probe curled the target task's actual private IP
+(`172.31.77.147:8080/healthz`, read from `aws ecs describe-tasks`'
+`attachments[0].details`) — a genuinely different task hitting the
+service over the network, exercising `sg-0d5a5ad558d893f7c`'s inbound rule
+for real, not a loopback check inside the same container. Result, read
+from the probe's CloudWatch log stream:
+
+```
+HTTP_STATUS:200
+BODY:
+{"status":"ok"}
+```
+
+The probe task definition was deregistered (`INACTIVE`) immediately after
+— it served its purpose as a one-off check, not a resource meant to stick
+around. This closes the "not yet verified" gap noted right above when this
+session was first written.
 
 ### State at the end of this session
 
