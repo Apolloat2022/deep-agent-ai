@@ -503,6 +503,49 @@ successfully (a model this account already had access to before this
 session). This is purely an entitlement-propagation gap on Anthropic's
 newest two Bedrock model listings, specific to this account.
 
+### Confirmed independently via a second API surface (still blocked, many hours later)
+
+The operator tested both models directly in the AWS console's Bedrock
+Mantle model catalog playground (`us-east-1.console.aws.amazon.com/bedrock-mantle/projects/default/model-catalog`)
+— a separate code path from the `aws bedrock-runtime converse` CLI calls
+above, returning native Anthropic-style API error envelopes rather than
+AWS's. Same result, both models, request IDs included as evidence for a
+support case:
+
+| Model | Result | Request ID |
+| --- | --- | --- |
+| `anthropic.claude-opus-4-8` | `403 permission_error: ... is not available for this account` | `req_ognuj6ecaolkx46oplk7f2uood7xt3siwqx3zn3pdh6lhugtubiq` |
+| `anthropic.claude-sonnet-5` | `403 permission_error: ... is not available for this account` | `req_l65rm3n6bwpoh4dqequysujf6cfk56dw5735wze5t74n7twzg6qa` |
+
+For comparison, `Grok 4.3` in that same playground invoked successfully —
+confirming the playground itself works and the account can reach it; the
+block is specific to these two Claude models.
+
+**This changes the conclusion from "wait longer" to "this needs a support
+case."** Two independent API surfaces (classic Bedrock Converse, and this
+Mantle-style playground — which per AWS/Anthropic's own naming is the
+Anthropic-operated "Claude Platform on AWS" surface, not classic
+AWS-operated Bedrock) reject both models identically, hours after
+`get-foundation-model-availability` started reporting `AUTHORIZED`. This is
+no longer explainable as ordinary propagation delay. **Recommended next
+step for the operator**: open a support case with the evidence table above
+(both request IDs are exactly what a support engineer needs to trace the
+failure server-side). Try both AWS Support and, if there's a direct channel
+available, Anthropic support — since this Mantle surface is Anthropic-run,
+it's not obvious which side owns the fix.
+
+### Temporary fallback while this is unresolved
+
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0` is confirmed working right
+now, on the account's pre-existing entitlement. If the deep agent service
+needs to be usable before the access issue above is resolved, set
+`ORCHESTRATOR_MODEL` and `SUBAGENT_MODEL` to
+`bedrock_converse:us.anthropic.claude-sonnet-4-5-20250929-v1:0` (env vars,
+no code change) and switch back once Opus 4.8 / Sonnet 5 clear up. Not done
+by default — the two-tier Opus 4.8 / Sonnet 5 split in `PLAN.md`'s model
+strategy was a deliberate choice made on quality and cost grounds, and
+Sonnet 4.5 is a real downgrade from both, not a drop-in equivalent.
+
 ### AWS resources created (real, in the account, all read back and confirmed)
 
 All of the following were created directly — cheap, reversible, and clear
