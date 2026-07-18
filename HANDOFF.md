@@ -9,10 +9,11 @@ contracts that were expensive to establish (the approval interrupt payload,
 the persistence topology, the enterprise client behavior, the Bedrock IAM
 pattern) so future work does not rediscover them.
 
-**If picking this up fresh: read Session 7 first.** It's the actual
-current state of the one remaining task (creating the ECS service) and
-documents two live blockers that aren't resolved yet — starting from an
-earlier session's "what's left" list will re-derive ground already covered.
+**If picking this up fresh: read Session 9 first.** The ECS service is now
+up and running cleanly against a real Bedrock model — Session 9 closed out
+the deploy that Sessions 7 and 8 were blocked on. Only the two long-standing
+AWS-side items (Bedrock entitlement for Opus 4.8/Sonnet 5, GitHub OIDC)
+remain open.
 
 **Current state, as of Session 6:** the account is a real AWS account
 (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
@@ -1119,3 +1120,144 @@ blocker, but the first time the specific underlying cause (corrupted
 6. Bedrock entitlement (Opus 4.8 / Sonnet 5) and GitHub OIDC remain exactly
    as documented in Sessions 4/6 — unrelated to this session's work, still
    open.
+
+## Session 9 (Sonnet): Docker Desktop was healthy again, both remaining bugs fixed, service is up
+
+The operator confirmed Docker Desktop was working (`docker ps` succeeded —
+the corrupted `daemon.json` from the end of Session 8 had been reset). This
+session picked up exactly where Session 8 left off: rebuild, push, scale
+back up, and watch the result rather than re-deriving anything.
+
+### First rebuild: the Session 8 `deepagents` fix confirmed correct
+
+`git status` showed the `deepagents`-copy fix from Session 8
+(`411f5a1`) was already committed — nothing uncommitted to worry about.
+Built the image, and **before pushing**, verified locally with `docker run
+... python -c "import deepagents"` — succeeded, resolving to the vendored
+source path. This local check was deliberately added this session; Session
+8 never got the chance to run it before Docker failed again.
+
+### A real ECR/Fargate image-propagation race, observed directly
+
+Pushed the rebuilt image, then immediately called
+`aws ecs update-service --desired-count 1 --force-new-deployment`. The task
+that launched (~50 seconds after the push returned) pulled
+`imageDigest: sha256:61e52212...` — **the old, still-broken image from
+Session 8's first push**, not the digest just pushed
+(`sha256:7b3456f5...`), confirmed by cross-referencing `aws ecr
+describe-images` (which showed `latest` correctly repointed to the new
+digest by push time) against `aws ecs describe-tasks` on the launched task.
+The task crash-looped with the exact same `ModuleNotFoundError: No module
+named 'deepagents'` as Session 8, even though the fix was real and verified
+locally. This was not a code problem — it was ECS/Fargate resolving the
+`latest` tag to a stale cached manifest in the seconds right after a push.
+**Not chased further or engineered around** (e.g. with digest-pinning or a
+unique tag per build) since it self-resolved: the very next replacement
+task ECS launched (a few seconds later, same `force-new-deployment`, no
+new command needed) pulled the correct new digest. If this recurs, the
+practical workaround is simply waiting ~30-60s after a push before forcing
+a new deployment, or checking the launched task's `imageDigest` against
+`aws ecr describe-images` before trusting a deploy.
+
+### Second real bug found, distinct from Session 8's: `langchain-aws` missing from the image
+
+Once the correct new image was running, it crash-looped again — a
+**different** error this time, caught in CloudWatch Logs:
+
+```
+ImportError: Initializing ChatBedrockConverse requires the langchain-aws
+package. Please install it with `pip install langchain-aws`
+```
+
+Root cause, read directly from `Dockerfile`, not guessed: the builder
+stage's `uv pip install` list installed `deepagents` editable but without
+its `[aws]` extra (`-e /app/deep-agent-core/libs/deepagents`), and never
+listed `langchain-aws` as a standalone dependency either. Confirmed against
+`deep-agent-core/libs/deepagents/pyproject.toml` line 32
+(`aws = ["langchain-aws>=1.6.2,<2.0.0"]`) that the `[aws]` extra is exactly
+what supplies it. Both `README.md` (the documented local dev install
+command) and `.github/workflows/deep-agent-service.yml` (the CI install
+step) already install `-e "./libs/deepagents[aws]"` / `-e
+"deep-agent-core/libs/deepagents[aws]"` — **the `Dockerfile` was the one
+install path that had drifted from that pattern**, present since Session 3
+wrote it, invisible until now for the same reason as Session 8's bug: no
+container had ever actually started `service/app.py` against a real Bedrock
+model before this session (Session 8's container never got past the
+`deepagents` import; every session before that never had a working
+container at all).
+
+**Fix applied** (`Dockerfile`, one line): changed the editable install
+target from `-e /app/deep-agent-core/libs/deepagents` to
+`-e "/app/deep-agent-core/libs/deepagents[aws]"`. Rebuilt; before pushing
+this time, verified locally with a stronger check than Session 8's (which
+only checked `import deepagents`) — `import langchain_aws` and a real
+`init_chat_model("bedrock_converse:...")` call, confirming the full import
+chain FastAPI's startup hook exercises. This second check correctly failed
+locally on a missing-credentials/region `pydantic_core.ValidationError`
+(expected — no AWS credentials or `AWS_REGION` were passed to the local
+`docker run`; ECS supplies both via the task role and task definition env),
+not an import error — confirming the fix without needing real AWS access
+from this local check.
+
+### Deploy, this time confirmed genuinely stable
+
+Pushed the corrected image, confirmed via `aws ecr describe-images` that
+`latest` pointed at the new digest before forcing a new deployment (the
+manual check this session's earlier race motivated). Forced a new
+deployment; the launched task pulled the correct digest, reached `RUNNING`,
+and **stayed `RUNNING`** through repeated polling (not just a momentary
+state before a crash, which is what made Session 8 and this session's first
+attempt look deceptively fine at first glance). CloudWatch Logs for that
+task's stream show a clean startup with no errors:
+
+```
+INFO:     Started server process [1]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+```
+
+`aws ecs describe-services` confirmed the old (Session 8) deployment fully
+drained to `runningCount: 0` / `rolloutState: COMPLETED`, and the new one
+holds `runningCount: 1` / `desiredCount: 1` — steady state, not a transient
+reading during the swap (a `runningCount: 2` seen mid-transition was the two
+deployments overlapping for a few seconds, not a real problem, and resolved
+on its own).
+
+### What was not verified
+
+`/healthz` itself was not curled — there is still no ALB (VPC-internal
+only, per Session 8's networking decision) and `enableExecuteCommand` is
+still `false` on this service, so nothing in this session had a path to
+reach port 8080 directly. The evidence for a healthy service is the clean
+CloudWatch startup log (FastAPI's own `/healthz` route registration
+happens as part of that same successful startup) plus the stable
+`RUNNING` status, not a direct HTTP round trip. If a real end-to-end
+`/healthz` check matters, that needs either `enableExecuteCommand: true`
+plus `aws ecs execute-command`, or a request from another resource already
+inside `vpc-091813aebe7c9dce3`.
+
+### State at the end of this session
+
+* ECS service `deep-agent-core-service`: `ACTIVE`, one task, `RUNNING`,
+  stable, running the corrected image
+  (`sha256:70cae01070f6cc02dce9932f6148f2f30efbbac3f639e9e1a57c237508de1f07`).
+* `Dockerfile` has the `[aws]` extra fix applied — **uncommitted** as of
+  this writing; the operator should review and commit it (one line change,
+  `libs/deepagents` → `libs/deepagents[aws]` in the `uv pip install`
+  command).
+* Both bugs that blocked Sessions 7/8 (`deepagents` missing at runtime,
+  `langchain-aws` missing at runtime) are now fixed in the image actually
+  running in ECS.
+
+### What's left
+
+Unchanged from every session since Session 6: Bedrock entitlement for Opus
+4.8 / Sonnet 5 (see Session 4's evidence table — likely needs an AWS/
+Anthropic support case) and GitHub OIDC for automated CI deploys (the
+operator's call, not created). The service currently runs on the temporary
+Sonnet 4.5 default from Session 6. Optionally worth a follow-up, not done
+this session: an actual `/healthz` round trip from inside the VPC, and
+deciding whether the ECR tag-propagation race above is worth engineering
+around (digest-pinning the task definition, or a build-unique tag) if it
+recurs.

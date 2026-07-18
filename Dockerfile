@@ -18,7 +18,7 @@ COPY service/ /app/service/
 
 RUN uv venv /opt/venv && \
     uv pip install -p /opt/venv \
-        -e /app/deep-agent-core/libs/deepagents \
+        -e "/app/deep-agent-core/libs/deepagents[aws]" \
         langgraph \
         langgraph-checkpoint-postgres \
         "psycopg[binary,pool]" \
