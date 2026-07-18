@@ -1,31 +1,40 @@
 # Handoff
 
-This document records the work completed across five sessions (Opus,
+This document records the work completed across six sessions (Opus,
 Sonnet, Sonnet again after a stalled Haiku attempt, Sonnet with real AWS
-access, then Sonnet again for the `.env`/dotenv follow-up) and pins down
-the contracts that were expensive to establish (the approval interrupt
-payload, the persistence topology, the enterprise client behavior, the
-Bedrock IAM pattern) so future work does not rediscover them.
+access, Sonnet again for the `.env`/dotenv follow-up, then Sonnet once more
+for a temporary model switch and a real bug it exposed) and pins down the
+contracts that were expensive to establish (the approval interrupt payload,
+the persistence topology, the enterprise client behavior, the Bedrock IAM
+pattern) so future work does not rediscover them.
 
-**Current state, as of Session 5:** the account is a real AWS account
+**Current state, as of Session 6:** the account is a real AWS account
 (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
 reconciled against rather than guessed. Models are served through Amazon
 Bedrock, not the first party Anthropic API — a deliberate choice made once
 real AWS access existed and revealed the account's existing pattern. The
 operator provisioned a dedicated Neon Postgres instance; the `DATABASE_URL`
 secret is created, `deploy/task-definition.json` is registered with ECS
-(revision 1, `ACTIVE`) with **no placeholders left**, and — new in Session
-5 — the full `AGENT_ENV=prod` persistence path has been verified against
-that real database (connect, create tables, compile the graph, query
-state), the first genuine end to end Postgres test this project has had.
-`.env` now loads automatically via `python-dotenv` in local development.
-Two things remain genuinely open: Bedrock model access for
-`us.anthropic.claude-opus-4-8` / `us.anthropic.claude-sonnet-5` is
-authorized at the control-plane level but still rejected by the live
-Converse API (an AWS-side propagation gap, not a task on this repo's side),
-and GitHub OIDC federation for automated CI deploys is entirely the
-operator's call (this account has none at all). Both are spelled out
-exactly, with commands, in Session 4 below.
+(revision 1, `ACTIVE`) with **no placeholders left**, and the full
+`AGENT_ENV=prod` persistence path has been verified against that real
+database. `.env` loads automatically via `python-dotenv` in local
+development. **The full stack has now run green end to end**: `python
+agent.py` completed a real run against a real model for the first time in
+this project's history, and `pytest tests/` passes all 16 tests, 0 skipped
+— the three HITL integration tests included, which had never had a working
+model to run against before this session. That run also caught and fixed a
+real bug in `build_agent()`'s persistence fallback that had been silently
+broken since Session 2 (see Session 6 below).
+
+Two things remain genuinely open, unchanged by this session: Bedrock model
+access for `us.anthropic.claude-opus-4-8` / `us.anthropic.claude-sonnet-5`
+is confirmed blocked across two independent API surfaces despite
+`AUTHORIZED` control-plane status — this needs an AWS/Anthropic support
+case, not more waiting (see Session 4's evidence table) — and GitHub OIDC
+federation for automated CI deploys is entirely the operator's call (this
+account has none at all). The service is running on a **temporary** Sonnet
+4.5 default in the meantime (Session 6); revert instructions are inline in
+`agent.py`'s comments once Opus 4.8 / Sonnet 5 clear up.
 
 ## Session 1 (Opus): service scaffold
 
@@ -731,3 +740,105 @@ scenario risks side effects on other async code in the process, in
 particular `deepagents`' subprocess-based `execute` tool, which may have
 reasons to want the platform default loop on Windows. Documented as a
 workaround in README.md's Docker section instead of engineered around.
+
+## Session 6 (Sonnet): temporary Sonnet 4.5 default, and a real bug this finally exposed
+
+The operator confirmed the Bedrock access block on Opus 4.8 / Sonnet 5 with
+independent evidence (see the "Confirmed independently via a second API
+surface" note under Session 4 — both models fail identically in the AWS
+console's Bedrock Mantle playground, with request IDs, hours after
+`AUTHORIZED` status). Given how long this has been stuck, and confirmed
+across two API surfaces, the operator approved switching the service to
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0` — already confirmed working
+on this account — as a temporary default, applied now.
+
+### The model switch
+
+`agent.py`'s `ORCHESTRATOR_MODEL` and `SUBAGENT_MODEL` defaults both point
+at `bedrock_converse:us.anthropic.claude-sonnet-4-5-20250929-v1:0`, marked
+clearly as `# TEMPORARY` in the code with the revert instructions inline —
+the real target models (Opus 4.8 orchestrator, Sonnet 5 subagent) are named
+directly in the comment so reverting once access clears is a two-line
+change, no other code touched. This is **not** the permanent model
+strategy; see `PLAN.md` for that decision, which stands unchanged.
+
+### A real bug, only surfaced now because this is the first working model
+
+Testing the switch properly meant finally running `python agent.py` end to
+end with a model that actually responds — something that has never
+succeeded in this project before (no working credentials existed until
+now). It failed immediately, but not because of the model:
+
+```
+NotImplementedError: The SqliteSaver does not support async methods.
+Consider using AsyncSqliteSaver instead.
+```
+
+`build_agent()`'s fallback (used only by the `__main__` smoke test, when no
+persistence is passed in) constructed a **synchronous** `SqliteSaver`. Every
+tool in this graph has been async-only since Session 2
+(`fetch_entity_record`, `submit_change_request` — both call
+`EnterpriseClient` over async `httpx`), which means the graph can only be
+driven with `ainvoke`/`astream`, never `invoke`. A synchronous checkpointer
+cannot service an async run. **This fallback has been broken since Session
+2 and nothing caught it** — `service/app.py` never hits this code path (it
+always passes real async persistence explicitly), and the smoke test itself
+was never run against a working model until this session, so the bug had
+no way to surface. This is exactly the risk of "compiles, therefore
+correct" reasoning; the graph compiled fine every single time this fallback
+ran, because `SqliteSaver.setup()` is a synchronous call that works
+standalone — the break only happens on the first `await checkpointer.aget_tuple(...)`
+inside an actual run.
+
+**The fix is not "make `build_agent()` async and await inside it."** The
+checkpointer's connection has to stay open for the entire lifetime of the
+compiled graph — every later `ainvoke`/`aget_state` call needs it alive —
+not just for the moment `build_agent()` constructs things and returns. An
+`async with AsyncSqliteSaver.from_conn_string(...) as checkpointer:` block
+closes the connection the instant it exits, which would be before
+`build_agent()` even returned. The correct pattern, already used correctly
+in `service/app.py`, is for the **caller** to hold the persistence context
+manager open for as long as the graph is in use.
+
+Changes made:
+
+* `build_agent(checkpointer, store)` — both parameters are now required,
+  no default. The synchronous SQLite fallback (`sqlite3`, `SqliteSaver`,
+  `SqliteStore` imports, and the `STATE_DIR` module variable it needed) was
+  removed entirely rather than fixed in place — a function that silently
+  builds broken default persistence is worse than one that requires the
+  caller to be explicit, and `service/app.py` was already doing the right
+  thing anyway.
+* `_run_smoke_test()` now wraps both `build_agent()` and `agent.ainvoke()`
+  in a single `async with open_persistence() as (checkpointer, store):`
+  block, mirroring `service/app.py`'s pattern (which manually enters and
+  holds the context manager for the process lifetime instead, since a
+  server can't use a `with` block for something that outlives one function
+  call — the smoke test can, since it's a single short-lived run).
+
+### Full verification, including things that have never worked before this session
+
+* `python agent.py` — **first fully successful run in this project's
+  history**. Real Bedrock model (Sonnet 4.5), real async SQLite persistence,
+  real tool call to `fetch_entity_record`. The model correctly refused to
+  fabricate entity data when told the enterprise API wasn't configured
+  (`ENTERPRISE_API_BASE_URL` unset) and offered a sensible alternative —
+  exactly the constraint written into `SYSTEM_PROMPT`, now observed working
+  under a real model for the first time.
+* `pytest tests/` — **16 passed, 0 failed, 0 skipped.** This is also a
+  first: `test_hitl_integration.py`'s three tests (approve flow, reject
+  flow, 409-on-busy-thread) have been written since Session 2 but never
+  passed before, gated on a working model that didn't exist until now. They
+  drove the real FastAPI service through a real approve and a real reject
+  against Sonnet 4.5, asserting the exact interrupt and decision contract
+  documented in Contract 1.
+* `ruff check` / `ruff format --check` — clean on `agent.py` after the
+  edit.
+
+### What is still open
+
+Unchanged from Session 4/5: Bedrock access for Opus 4.8 / Sonnet 5 needs a
+support case (see the evidence table under Session 4); GitHub OIDC is the
+operator's call; the ECS service itself hasn't been created. Nothing new
+was added to this list — this session fixed a real bug and got the first
+genuine full-stack green run, it did not close any of the AWS-side items.

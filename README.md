@@ -80,11 +80,11 @@ DATABASE_URL=postgresql://user:password@host:5432/dbname
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AWS_REGION` | none, required | Region for Bedrock and, if used, other AWS calls. Both target models are only available as `us-east-1` cross region inference profiles in this account. |
-| `ORCHESTRATOR_MODEL` | `bedrock_converse:us.anthropic.claude-opus-4-8` | Model for the top level agent. The `bedrock_converse:` prefix selects `langchain_aws.ChatBedrockConverse` via `init_chat_model`; the `us.` prefix on the model ID is a cross region inference profile, not the bare foundation model ID -- neither target model supports on demand invocation in this account. |
-| `SUBAGENT_MODEL` | `bedrock_converse:us.anthropic.claude-sonnet-5` | Model for the research subagent |
+| `AWS_REGION` | none, required | Region for Bedrock and, if used, other AWS calls. |
+| `ORCHESTRATOR_MODEL` | **Temporary**: `bedrock_converse:us.anthropic.claude-sonnet-4-5-20250929-v1:0`. Real target: `bedrock_converse:us.anthropic.claude-opus-4-8` | Model for the top level agent. The `bedrock_converse:` prefix selects `langchain_aws.ChatBedrockConverse` via `init_chat_model`; the `us.` prefix on the model ID is a cross region inference profile, not the bare foundation model ID. Currently defaulted to Sonnet 4.5 because Opus 4.8 / Sonnet 5 access is blocked on an unresolved AWS/Anthropic-side issue -- see [HANDOFF.md](HANDOFF.md) Session 6. Revert once that clears. |
+| `SUBAGENT_MODEL` | **Temporary**: `bedrock_converse:us.anthropic.claude-sonnet-4-5-20250929-v1:0`. Real target: `bedrock_converse:us.anthropic.claude-sonnet-5` | Model for the research subagent. Same temporary override as `ORCHESTRATOR_MODEL`, same reason. |
 | `AGENT_WORKSPACE` | `./workspace` | Filesystem root the agent's file tools operate in |
-| `AGENT_STATE_DIR` | `./state` | Local SQLite checkpoint and store files, used when persistence is not injected |
+| `AGENT_STATE_DIR` | `./state` | Local async SQLite checkpoint and store files, used by `open_persistence()` when `AGENT_ENV=local` |
 | `AGENT_ENV` | `local` | `local` selects async SQLite, `prod` selects async Postgres |
 | `DATABASE_URL` | none, required when `AGENT_ENV=prod` | Postgres connection string |
 | `ENTERPRISE_API_BASE_URL` | unset | Base URL of the enterprise data and workflow API. With no base URL, tool calls return a labeled "not configured" result instead of failing, so the agent runs standalone |

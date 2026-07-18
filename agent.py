@@ -9,7 +9,10 @@ demonstrates the three integration points required by the platform:
    an async HTTP client configured via ``ENTERPRISE_API_BASE_URL``. With
    no base URL set, the tools return a clearly labeled "not configured"
    result instead of failing, so this module runs standalone.
-3. Durable persistence through a local SQLite checkpointer and store.
+3. Durable persistence, always caller supplied via
+   ``service.persistence.open_persistence()`` (async SQLite locally, async
+   Postgres in prod) -- see ``build_agent``'s docstring for why this
+   function does not construct a default itself.
 
 Models are served through Amazon Bedrock (``langchain_aws.ChatBedrockConverse``,
 selected via the ``bedrock_converse:`` prefix on ``init_chat_model``), matching
@@ -31,7 +34,6 @@ interrupt and wait for an explicit approval decision from the client.
 from __future__ import annotations
 
 import os
-import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -40,11 +42,10 @@ from deepagents.backends import FilesystemBackend
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.store.sqlite import SqliteStore
 
 from service.clients import EnterpriseClientError, get_enterprise_client
+from service.persistence import open_persistence
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -58,14 +59,24 @@ if TYPE_CHECKING:
 # real environment (ECS task definition values always win).
 load_dotenv()
 
+# TEMPORARY: the real target models are Opus 4.8 and Sonnet 5 (see
+# PLAN.md's model strategy), but Bedrock access to both is stuck in a
+# confirmed AWS/Anthropic-side entitlement bug -- authorized at the control
+# plane, still rejected on every real invoke, across two independent API
+# surfaces (classic Bedrock Converse and the Bedrock Mantle playground).
+# See HANDOFF.md for the full evidence and the support case this needs.
+# Defaulting to Sonnet 4.5, which is confirmed working on this account, so
+# the service is usable while that access issue is being resolved. Revert
+# both defaults below once Opus 4.8 / Sonnet 5 are unblocked -- no other
+# code change is needed.
 ORCHESTRATOR_MODEL = os.environ.get(
-    "ORCHESTRATOR_MODEL", "bedrock_converse:us.anthropic.claude-opus-4-8"
+    "ORCHESTRATOR_MODEL",
+    "bedrock_converse:us.anthropic.claude-sonnet-4-5-20250929-v1:0",
 )
 SUBAGENT_MODEL = os.environ.get(
-    "SUBAGENT_MODEL", "bedrock_converse:us.anthropic.claude-sonnet-5"
+    "SUBAGENT_MODEL", "bedrock_converse:us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 )
 WORKSPACE_DIR = Path(os.environ.get("AGENT_WORKSPACE", "./workspace")).resolve()
-STATE_DIR = Path(os.environ.get("AGENT_STATE_DIR", "./state")).resolve()
 
 SYSTEM_PROMPT = """\
 You are the orchestrator for an enterprise operations platform.
@@ -128,41 +139,35 @@ async def submit_change_request(summary: str, payload: str) -> str:
 
 
 def build_agent(
-    checkpointer: BaseCheckpointSaver | None = None,
-    store: BaseStore | None = None,
+    checkpointer: BaseCheckpointSaver,
+    store: BaseStore,
 ) -> CompiledStateGraph:
     """Construct and compile the deep agent graph.
 
-    Persistence is injected so the caller controls durability. The FastAPI
-    service passes async Postgres (or async SQLite) implementations; when
-    both are omitted the function falls back to a synchronous local SQLite
-    checkpointer and store, which is enough for the ``__main__`` smoke test.
+    Persistence is always caller supplied -- this function does not create
+    a default. Every tool in this graph is async only (``fetch_entity_record``
+    and ``submit_change_request`` call an async HTTP client), so the graph
+    can only be driven with ``ainvoke``/``astream``, never ``invoke``. That
+    means the checkpointer and store must be async implementations too: a
+    synchronous ``SqliteSaver`` raises ``NotImplementedError`` the moment an
+    async run touches it. An earlier version of this function constructed a
+    synchronous local SQLite fallback when persistence was omitted -- it
+    compiled fine but broke on the first real ``ainvoke`` call, since
+    nothing had exercised that path with a real model until now. Get
+    persistence from ``service.persistence.open_persistence()`` (async
+    SQLite locally, async Postgres in prod) and hold its context manager
+    open for as long as the returned graph is in use -- see
+    ``_run_smoke_test`` below or ``service/app.py`` for the pattern.
 
     Args:
-        checkpointer: Conversation state store keyed by ``thread_id``. When
-            ``None``, a local synchronous SQLite checkpointer is created.
-        store: Cross thread memory store. When ``None``, a local
-            synchronous SQLite store is created.
+        checkpointer: Async conversation state store keyed by ``thread_id``.
+        store: Async cross thread memory store.
 
     Returns:
-        The compiled LangGraph state graph, ready for ``invoke``,
-        ``ainvoke``, or ``astream`` with a per thread configurable.
+        The compiled LangGraph state graph, ready for ``ainvoke`` or
+        ``astream`` with a per thread configurable.
     """
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    if checkpointer is None:
-        checkpoint_conn = sqlite3.connect(
-            STATE_DIR / "checkpoints.sqlite", check_same_thread=False
-        )
-        checkpointer = SqliteSaver(checkpoint_conn)
-        checkpointer.setup()
-    if store is None:
-        store_conn = sqlite3.connect(
-            STATE_DIR / "store.sqlite", check_same_thread=False
-        )
-        store = SqliteStore(store_conn)
-        store.setup()
 
     research_subagent = {
         "name": "research_subagent",
@@ -207,21 +212,28 @@ async def _run_smoke_test() -> None:
     httpx): a ``StructuredTool`` built from an ``async def`` has no sync
     ``func``, so ``agent.invoke(...)`` raises ``NotImplementedError``.
     ``ainvoke`` is required, not a style preference.
+
+    Uses ``open_persistence()`` in an ``async with`` block spanning both
+    ``build_agent`` and ``ainvoke``, exactly mirroring how ``service/app.py``
+    holds it open for the process lifetime -- the checkpointer's connection
+    must stay alive for every call the graph makes, not just its own
+    construction.
     """
-    agent = build_agent()
-    config = {"configurable": {"thread_id": "local_smoke_test"}}
-    result = await agent.ainvoke(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Fetch entity 42, summarize it, and draft a change request.",
-                }
-            ]
-        },
-        config=config,
-    )
-    print(result["messages"][-1].content)
+    async with open_persistence() as (checkpointer, store):
+        agent = build_agent(checkpointer=checkpointer, store=store)
+        config = {"configurable": {"thread_id": "local_smoke_test"}}
+        result = await agent.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Fetch entity 42, summarize it, and draft a change request.",
+                    }
+                ]
+            },
+            config=config,
+        )
+        print(result["messages"][-1].content)
 
 
 if __name__ == "__main__":
