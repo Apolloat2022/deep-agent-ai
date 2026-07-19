@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 
-# Build context is the project root (deep-agent-ai/). The deepagents
-# library is installed editable from the vendored clone at
-# deep-agent-core/libs/deepagents, so that directory must be copied in
-# before the install step.
+# Build context is the project root (deep-agent-ai/). deepagents is installed
+# from PyPI (pinned to the version the vendored deep-agent-core clone tracks),
+# not from a local editable path, so the source tree does not need to be in
+# the build context or the image -- CI checkouts don't include it (it's a
+# gitignored embedded repo). Bump this pin when the vendored clone is updated.
 
 FROM python:3.13-slim AS builder
 
@@ -11,14 +12,13 @@ RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 
-COPY deep-agent-core/libs/deepagents /app/deep-agent-core/libs/deepagents
 COPY pyproject.toml /app/pyproject.toml
 COPY agent.py /app/agent.py
 COPY service/ /app/service/
 
 RUN uv venv /opt/venv && \
     uv pip install -p /opt/venv \
-        -e "/app/deep-agent-core/libs/deepagents[aws]" \
+        "deepagents[aws]==0.6.12" \
         langgraph \
         langgraph-checkpoint-postgres \
         "psycopg[binary,pool]" \
@@ -34,7 +34,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /app/deep-agent-core/libs/deepagents /app/deep-agent-core/libs/deepagents
 COPY agent.py /app/agent.py
 COPY service/ /app/service/
 

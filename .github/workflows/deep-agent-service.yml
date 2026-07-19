@@ -24,7 +24,7 @@ jobs:
         run: |
           uv venv .venv
           uv pip install -p .venv \
-            -e "deep-agent-core/libs/deepagents[aws]" \
+            "deepagents[aws]==0.6.12" \
             langgraph \
             langgraph-checkpoint-postgres \
             "psycopg[binary,pool]" \
