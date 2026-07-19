@@ -9,12 +9,19 @@ contracts that were expensive to establish (the approval interrupt payload,
 the persistence topology, the enterprise client behavior, the Bedrock IAM
 pattern) so future work does not rediscover them.
 
-**If picking this up fresh: read Session 9 first**, then Session 10. The ECS
-service is up and running cleanly against a real Bedrock model (Session 9
-closed out the deploy that Sessions 7 and 8 were blocked on), and GitHub
-OIDC federation for CI is now fully wired (Session 10). Only one
-long-standing AWS-side item remains open: Bedrock entitlement for Opus
-4.8/Sonnet 5.
+**If picking this up fresh: read Session 9 first**, then Sessions 10–11. The
+ECS service is up and running cleanly against a real Bedrock model (Session 9
+closed out the deploy that Sessions 7 and 8 were blocked on); GitHub OIDC
+federation for CI is wired **and proven working** (Sessions 10–11 — GitHub
+successfully assumed the role in a real workflow run, confirmed in
+CloudTrail); and the service now runs a freshly rebuilt image
+(`sha256:e28f9d80…`) that installs `deepagents` from PyPI instead of a
+gitignored local clone (Session 11). Two items remain open: Bedrock
+entitlement for Opus 4.8/Sonnet 5 (long-standing), and one **new** loose end
+— the CI `build-and-push` job has never been *observed* green end to end
+(Session 11 deployed the image manually to unblock; the job's blockers are
+all fixed and locally validated, but a fully-green automated run hasn't been
+watched yet — the next push to `main` is the proof).
 
 **Current state, as of Session 6:** the account is a real AWS account
 (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
@@ -1433,3 +1440,105 @@ Only Bedrock entitlement for Opus 4.8 / Sonnet 5 remains from the
 long-standing list (Session 4's evidence table — an AWS/Anthropic support
 case, not a code change). OIDC is no longer on that list. The service still
 runs on the temporary Sonnet 4.5 default (Session 6).
+
+## Session 11 (Opus): OIDC proven end to end, three latent CI bugs fixed, image rebuilt from PyPI and redeployed
+
+Session 10 wired OIDC but never ran the workflow. This session pushed to
+`main` to exercise it for real, which — for the first time in this project —
+got CI far enough to surface a cascade of **pre-existing latent bugs in the
+workflow itself**, none of which had ever been hit because CI had never
+gotten past its first steps before. Each was diagnosed against a real
+CI-mirror venv (a clean `python -m venv` installing the exact workflow
+dependency set), fixed, validated locally, and pushed; the runs were tracked
+without `gh` by polling ECR for a new image digest and reading CloudTrail for
+`AssumeRoleWithWebIdentity` events.
+
+### OIDC is confirmed working, not just configured
+
+CloudTrail showed multiple **successful** (`ErrorCode: None`)
+`AssumeRoleWithWebIdentity` events once the earlier `test`-job steps started
+passing — GitHub Actions really did assume
+`arn:aws:iam::924056189531:role/deep-agent-core-github-actions` via the
+provider. This is the actual proof Session 10 couldn't provide. The
+federation, trust policy (`repo:Apolloat2022/deep-agent-ai:*`), and
+`id-token: write` permission all work.
+
+### Three latent CI bugs, fixed in order as each unblocked the next
+
+1. **`ruff check .` failure** (commit `467f448`) — two `E741` ambiguous
+   single-letter `l` loop variables in `examples/run_demo.py`'s SSE parser
+   (added with the examples demo, never linted in CI before). Renamed to
+   `ln`; `ruff check .` clean repo-wide.
+2. **`deepagents` absent on the runner** (commit `c4f2322`) — the real
+   structural bug. `deep-agent-core/` is a **gitignored embedded git repo**
+   (a pristine clone of `github.com/langchain-ai/deepagents` @ `e14e0adc`,
+   version 0.6.12, no local edits — `.gitignore` line 3), so it is **absent
+   from this repo on GitHub entirely**. Both the `test` job's
+   `-e "deep-agent-core/libs/deepagents[aws]"` editable install and the
+   Dockerfile's `COPY deep-agent-core/...` assumed it was on disk; it only
+   ever worked from a local machine where the folder physically exists. Fixed
+   by installing `deepagents[aws]==0.6.12` from **PyPI** in both the workflow
+   and the Dockerfile (the vendored copy is byte-identical to the published
+   release — verified). The Dockerfile no longer copies the vendored source
+   into the build context or runtime image, which also **retires the Session
+   8 editable-install `COPY --from=builder .../deepagents` workaround** — a
+   normal PyPI install puts the package in `site-packages`, so the source
+   tree is not needed at runtime. **To update deepagents, bump the pin** in
+   `.github/workflows/deep-agent-service.yml` and `Dockerfile` (and the
+   vendored clone if you keep it for local reference).
+3. **`langgraph-checkpoint-sqlite` missing from the CI install list**
+   (commit `3df9fe5`) — the `test` job runs pytest with `AGENT_ENV` unset, so
+   `service/persistence.py` takes its local branch and imports
+   `AsyncSqliteSaver` / `AsyncSqliteStore` from `langgraph.checkpoint.sqlite`
+   / `langgraph.store.sqlite`. That package was never installed, so the HITL
+   integration tests (which build the FastAPI app and open persistence)
+   `ModuleNotFoundError`'d once OIDC auth started working and pytest actually
+   ran. Added the one package to the `test` job only — the runtime image runs
+   `AGENT_ENV=prod` against Postgres and never touches the SQLite path, so the
+   Dockerfile is unchanged. Confirmed in the CI-mirror venv: full suite
+   **16 passed, 0 skipped**, the three Bedrock HITL tests actually invoking
+   Sonnet 4.5 (not skipped).
+
+### Why the deploy was ultimately done manually
+
+After the third fix, run 4's poller still timed out with no image pushed.
+CloudTrail confirmed OIDC assumed successfully again, but no ECR push
+followed, and **without the Actions log (`gh` not installed) the `test`-vs-
+`build-and-push` boundary couldn't be disambiguated**. Rather than keep
+round-tripping one CI failure at a time through the operator's eyes on the
+Actions tab, and since Docker Desktop was healthy this session, the operator
+chose to **build and push the image manually** to get the (functionally
+equivalent, just PyPI-based) new image deployed, and finish confirming the
+automated pipeline separately.
+
+Manual build/push/deploy, all verified:
+
+* `docker build` on the new Dockerfile succeeded; verified imports **inside
+  the built image** (`docker run ... python -c "import deepagents,
+  langchain_aws; from langchain.chat_models import init_chat_model"`) →
+  `deepagents 0.6.12`, clean.
+* Pushed `sha256:e28f9d805556dcb5b1eed5647a283a7c86702d352e918a6ecf06912eb299e85f`
+  to ECR, tagged both `latest` and `3df9fe5` (the unique tag guards against
+  the Session 9 `latest`-propagation race).
+* `aws ecs update-service --force-new-deployment`, then monitored to genuine
+  steady state: the new task pulled the **correct** digest (`e28f9d80`, not a
+  stale cache), reached `healthStatus: HEALTHY`, the old deployment drained
+  (2→1 tasks), `rolloutState: COMPLETED`, `runningCount: 1 == desiredCount`.
+  Confirmed by checking `healthStatus` and `imageDigest` directly, not just
+  `lastStatus: RUNNING` (the Session 9 lesson).
+
+### What's left
+
+* **Bedrock entitlement for Opus 4.8 / Sonnet 5** — unchanged, long-standing,
+  needs an AWS/Anthropic support case (Session 4's evidence table). Service
+  still on the temporary Sonnet 4.5 default (Session 6).
+* **CI `build-and-push` never observed green end to end** — new this session.
+  All its known blockers are fixed and locally validated, and OIDC auth is
+  proven, but no fully-green automated run has been watched (the image in ECR
+  was pushed by hand, not by CI). The **next push to `main`** is the proof:
+  watch it either in the Actions tab, or from here by polling ECR for a new
+  digest + CloudTrail for the assume/push events (the method used all session).
+  If it fails, the remaining suspect is the `build-and-push` job's own
+  `docker build`/`docker push` steps, which have never run in CI (the
+  Dockerfile is now PyPI-based, so the old `deep-agent-core` COPY problem is
+  gone, but that path is still unproven on a GitHub runner).
