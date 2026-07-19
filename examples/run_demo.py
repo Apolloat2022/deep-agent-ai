@@ -68,8 +68,8 @@ def parse_sse(raw: str) -> list[tuple[str, dict]]:
             continue
         lines = block.splitlines()
         try:
-            event_line = next(l for l in lines if l.startswith("event: "))
-            data_line = next(l for l in lines if l.startswith("data: "))
+            event_line = next(ln for ln in lines if ln.startswith("event: "))
+            data_line = next(ln for ln in lines if ln.startswith("data: "))
         except StopIteration:
             continue
         events.append(
