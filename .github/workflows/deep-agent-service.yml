@@ -27,6 +27,7 @@ jobs:
             "deepagents[aws]==0.6.12" \
             langgraph \
             langgraph-checkpoint-postgres \
+            langgraph-checkpoint-sqlite \
             "psycopg[binary,pool]" \
             fastapi \
             "uvicorn[standard]" \
