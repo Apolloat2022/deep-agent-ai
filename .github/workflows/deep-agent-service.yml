@@ -67,10 +67,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # OIDC federation set up in Session 10: provider
+      # OIDC federation (Sessions 10-12): provider
       # token.actions.githubusercontent.com plus the role below, whose trust
-      # policy is scoped to repo:Apolloat2022/deep-agent-ai:*. The role grants
-      # ECR push (this job) and Bedrock invoke (the test job). See HANDOFF.md.
+      # policy matches GitHub's ID-customized sub claim for this repo. The role
+      # grants ECR push + ECS deploy (this job), Bedrock invoke (the test job),
+      # and iam:PassRole on the task/execution roles. See HANDOFF.md.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -90,3 +91,25 @@ jobs:
           docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      # Deploy the exact image just built, pinned to the immutable commit-SHA
+      # tag (not :latest) so ECS pulls the digest we intend and never a stale
+      # cached :latest -- the propagation race seen in Session 9. The render
+      # step injects that image into deploy/task-definition.json; the deploy
+      # step registers a new revision and updates the service, waiting for it
+      # to reach steady state before the job is considered successful.
+      - name: Render task definition with the pushed image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: deploy/task-definition.json
+          container-name: deep-agent-core-service
+          image: ${{ steps.ecr-login.outputs.registry }}/deep-agent-core-service:${{ github.sha }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: deep-agent-core-service
+          cluster: riskguard-cluster
+          wait-for-service-stability: true
