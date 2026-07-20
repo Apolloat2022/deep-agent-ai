@@ -9,19 +9,17 @@ contracts that were expensive to establish (the approval interrupt payload,
 the persistence topology, the enterprise client behavior, the Bedrock IAM
 pattern) so future work does not rediscover them.
 
-**If picking this up fresh: read Session 9 first**, then Sessions 10–11. The
+**If picking this up fresh: read Session 9 first**, then Sessions 10–12. The
 ECS service is up and running cleanly against a real Bedrock model (Session 9
 closed out the deploy that Sessions 7 and 8 were blocked on); GitHub OIDC
-federation for CI is wired **and proven working** (Sessions 10–11 — GitHub
-successfully assumed the role in a real workflow run, confirmed in
-CloudTrail); and the service now runs a freshly rebuilt image
-(`sha256:e28f9d80…`) that installs `deepagents` from PyPI instead of a
-gitignored local clone (Session 11). Two items remain open: Bedrock
-entitlement for Opus 4.8/Sonnet 5 (long-standing), and one **new** loose end
-— the CI `build-and-push` job has never been *observed* green end to end
-(Session 11 deployed the image manually to unblock; the job's blockers are
-all fixed and locally validated, but a fully-green automated run hasn't been
-watched yet — the next push to `main` is the proof).
+federation for CI is wired **and proven green end to end** (Sessions 10–12 —
+the full `test` → `build-and-push` chain runs on a push to `main`, with the
+image pushed to ECR by the `deep-agent-core-github-actions` assumed role,
+confirmed in CloudTrail); and the service runs the CI-produced image
+(`sha256:5e730a6d…`, tagged with its commit SHA), which installs `deepagents`
+from PyPI instead of a gitignored local clone. **Only one long-standing item
+remains open: Bedrock entitlement for Opus 4.8/Sonnet 5** (an AWS/Anthropic
+support case — see Session 4). The CI pipeline is done.
 
 **Current state, as of Session 6:** the account is a real AWS account
 (`924056189531`, `us-east-1`, IAM user `Riskguard-ai`), discovered and
@@ -1542,3 +1540,103 @@ Manual build/push/deploy, all verified:
   `docker build`/`docker push` steps, which have never run in CI (the
   Dockerfile is now PyPI-based, so the old `deep-agent-core` COPY problem is
   gone, but that path is still unproven on a GitHub runner).
+
+## Session 12 (Opus): the last two CI blockers found and fixed — pipeline now proven green end to end
+
+Session 11 left the automated pipeline "should work, not observed." Watching
+real runs (still without `gh` — polling ECR + reading CloudTrail) surfaced
+two more genuine blockers, both invisible until CI got far enough to hit
+them, and **both initially misdiagnosed because the tooling hid them**. The
+lesson threaded through this whole effort: each "it passes locally" check was
+subtly not reproducing CI. Fixing that reproduction gap is what finally
+closed it.
+
+### Blocker A: OIDC trust policy didn't match GitHub's ID-customized `sub`
+
+Runs kept ending with no image and no obvious cause. The mistake was reading
+CloudTrail `AssumeRoleWithWebIdentity` events by timestamp only and assuming
+success; **pulling the full event detail with `errorCode` showed
+`AccessDenied`**, and the event's `principalId` revealed the actual `sub`
+GitHub presents:
+
+```
+repo:Apolloat2022@97480682/deep-agent-ai@1304455281:ref:refs/heads/main
+```
+
+The `@97480682` (org ID) and `@1304455281` (repo ID) mean this org/repo has
+**OIDC subject-claim customization enabled** — GitHub embeds the immutable
+numeric IDs in `sub`. The Session 10 trust policy matched the plain form
+`repo:Apolloat2022/deep-agent-ai:*`, which does not match the ID-embedded
+string, so every assume was denied and the `test` job died at "Configure AWS
+credentials" before running anything. (This also means the "OIDC works"
+claims earlier in Session 11 were from before the customization took effect
+or were misread — always check `errorCode`, not just that an event exists.)
+
+**Fix** (`aws iam update-assume-role-policy` on
+`deep-agent-core-github-actions`, no repo change): the `sub` StringLike
+condition is now a two-entry list —
+`repo:Apolloat2022@97480682/deep-agent-ai@1304455281:*` (pinned to the exact
+immutable org+repo IDs, which is *more* secure than the name form) and
+`repo:Apolloat2022/deep-agent-ai:*` (kept as a fallback in case the
+customization is ever turned off). After this, assume events returned
+`err=None` for real.
+
+### Blocker B: pytest `ModuleNotFoundError: No module named 'service'`
+
+With the assume fixed, the `test` job reached pytest and failed at
+**collection**: `from service...` / `import agent` couldn't resolve. Root
+cause is an invocation difference that every prior "16 passed locally" check
+had silently papered over:
+
+* CI runs the **console script** (`.venv/bin/pytest tests/`), which does
+  **not** put the current directory on `sys.path`.
+* Every local validation this project ran used **`python -m pytest`**, which
+  **does** insert the cwd — so `service`/`agent` imported locally and never
+  on the runner. `service/` and `agent.py` are committed and present on the
+  runner; the files were there, the path wasn't.
+
+**Fix** (`pyproject.toml`, commit `27c4865`): added `pythonpath = ["."]` to
+`[tool.pytest.ini_options]`, which puts the repo root on `sys.path` for any
+invocation. **Validated the right way this time** — re-ran with the `pytest`
+console script (not `python -m`) in a clean CI-mirror venv: 16 passed, the
+three Bedrock HITL tests included. The general lesson: reproduce the exact CI
+command, not a convenient equivalent.
+
+### Pipeline confirmed green, with hard evidence
+
+The push of `27c4865` ran the whole chain in ~70 seconds and pushed to ECR.
+Confirmed not by trusting a fast poller (whose "most-recent PutImage" briefly
+showed the old manual push due to CloudTrail delivery lag) but by reading the
+`PutImage` events' `userIdentity` directly:
+
+```
+2026-07-20T00:26:44Z  AssumedRole  assumed-role/deep-agent-core-github-actions/GitHubActions  tag=latest
+2026-07-20T00:26:43Z  AssumedRole  assumed-role/deep-agent-core-github-actions/GitHubActions  tag=27c4865e...
+```
+
+Both the `latest` tag and the commit-SHA tag were pushed **by the OIDC role**,
+not the `Riskguard-ai` IAM user — the unambiguous proof `build-and-push` ran
+end to end via federation. New image digest `sha256:5e730a6d…`.
+
+### Redeployed onto the CI-produced image
+
+The service had been running the Session 11 **manually**-built image
+(`e28f9d80`). To make the running artifact the one CI actually produces,
+`aws ecs update-service --force-new-deployment` was run with `latest`
+resolving to the CI image `5e730a6d`, and the rollout watched to genuine
+steady state (new task pulled the correct digest, `healthStatus: HEALTHY`,
+old deployment drained to a single `PRIMARY`, `rolloutState: COMPLETED`) —
+the same verification discipline as Session 9, checking `healthStatus` and
+`imageDigest`, not just `RUNNING`.
+
+### What's left
+
+* **Bedrock entitlement for Opus 4.8 / Sonnet 5** — the one remaining
+  long-standing item (Session 4's evidence table; an AWS/Anthropic support
+  case). Service still on the temporary Sonnet 4.5 default (Session 6).
+* Everything CI/OIDC-related is done and proven. Note the workflow **builds
+  and pushes only** — it still does not auto-deploy to ECS; a deploy remains a
+  manual `aws ecs update-service --force-new-deployment` (add `ecs:UpdateService`
+  + `iam:PassRole` to the role and a deploy step if you want that automated).
+* If GitHub's OIDC `sub` customization is ever changed, revisit the trust
+  policy's `sub` condition (the ID-pinned entry is the load-bearing one).
