@@ -1,10 +1,19 @@
 name: deep-agent-core-service
 
 on:
+  # Docs-only changes (any *.md, e.g. HANDOFF.md / README.md) skip the
+  # pipeline entirely -- no test run, and no build/deploy. Since the
+  # build-and-push job now auto-deploys to ECS, this keeps documentation
+  # commits from redeploying production. A push that also touches non-md files
+  # still runs normally.
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
 
 jobs:
   test:
