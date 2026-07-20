@@ -1,3 +1,7 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Put the repo root on sys.path so `service` and `agent` import regardless of
+# how pytest is invoked. CI runs the `pytest` console script (not
+# `python -m pytest`), which does not add the cwd to sys.path on its own.
+pythonpath = ["."]
