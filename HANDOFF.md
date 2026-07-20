@@ -1634,9 +1634,53 @@ the same verification discipline as Session 9, checking `healthStatus` and
 * **Bedrock entitlement for Opus 4.8 / Sonnet 5** — the one remaining
   long-standing item (Session 4's evidence table; an AWS/Anthropic support
   case). Service still on the temporary Sonnet 4.5 default (Session 6).
-* Everything CI/OIDC-related is done and proven. Note the workflow **builds
-  and pushes only** — it still does not auto-deploy to ECS; a deploy remains a
-  manual `aws ecs update-service --force-new-deployment` (add `ecs:UpdateService`
-  + `iam:PassRole` to the role and a deploy step if you want that automated).
+* Everything CI/OIDC-related is done and proven. **Update (Session 13): the
+  workflow now auto-deploys** — see Session 13; the "builds and pushes only"
+  caveat no longer applies.
 * If GitHub's OIDC `sub` customization is ever changed, revisit the trust
   policy's `sub` condition (the ID-pinned entry is the load-bearing one).
+
+## Session 13 (Opus): CI auto-deploy to ECS added and proven
+
+The workflow previously built and pushed to ECR but stopped there; deploys
+were manual. This session added an automated deploy to the `build-and-push`
+job, using the official `aws-actions/amazon-ecs-render-task-definition` +
+`amazon-ecs-deploy-task-definition` actions.
+
+**How it deploys:** after the image is pushed, the render step injects the
+**commit-SHA-tagged** image into `deploy/task-definition.json` (pinned to the
+immutable digest, deliberately *not* `:latest` — this sidesteps the Session 9
+`:latest` propagation race by construction), the deploy step registers a new
+task-definition revision and updates the service with
+`wait-for-service-stability: true`, so a failed or unhealthy rollout fails the
+CI job rather than passing silently.
+
+**IAM added to `deep-agent-core-github-actions`** (inline policy
+`ci-ecr-push-and-bedrock`, extended in place), all least-privilege:
+`ecs:RegisterTaskDefinition` + `ecs:DescribeTaskDefinition` (resource `*` —
+these don't support resource scoping), `ecs:UpdateService` +
+`ecs:DescribeServices` scoped to the service ARN, and `iam:PassRole` on
+exactly the task and execution role ARNs, conditioned on
+`iam:PassedToService=ecs-tasks.amazonaws.com`.
+
+**Proven end to end.** The push of `44134a7` ran the full chain and the
+deploy was watched to steady state: CI registered task-def revision
+`deep-agent-core-service:2` (the manual deploys had all reused revision 1
+pointing at `:latest`), the service rolled to it on image tag `44134a7…` (the
+commit SHA, confirming SHA-pinning worked), reached `healthStatus: HEALTHY`,
+drained the old deployment (2→1), `rolloutState: COMPLETED`. Every push to
+`main` now deploys autonomously: test → build → push → register revision →
+update service → wait-stable → HEALTHY.
+
+**One behavioral consequence worth knowing:** *any* push to `main` now
+rebuilds and redeploys, including docs-only commits (this HANDOFF update
+itself triggers a build + a no-op redeploy). If that's undesirable, add
+`paths-ignore` (e.g. `'**.md'`) to the `push` trigger, or gate the
+`build-and-push` job on changed paths — not done here to avoid changing
+trigger semantics without being asked.
+
+### What's left
+
+Unchanged: only Bedrock entitlement for Opus 4.8 / Sonnet 5 (Session 4's
+evidence table — AWS/Anthropic support case). CI, OIDC, and auto-deploy are
+all done and proven. Service runs the temporary Sonnet 4.5 default (Session 6).
